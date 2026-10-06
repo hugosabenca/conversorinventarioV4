@@ -11,3 +11,5 @@ pypdf
 faiss-cpu
 python-docx
 pdfplumber
+segno
+reportlab
