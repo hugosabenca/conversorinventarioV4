@@ -423,7 +423,7 @@ def gerar_qr_png(texto, escala=10):
     """Gera o QR Code em PNG (bytes)."""
     import segno
     buf = io.BytesIO()
-    segno.make(texto, error="m").save(buf, kind="png", scale=escala, border=2)
+    segno.make_qr(texto, error="m").save(buf, kind="png", scale=escala, border=4)
     buf.seek(0)
     return buf
 
