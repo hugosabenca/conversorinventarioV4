@@ -498,6 +498,213 @@ def gerar_pdf_etiquetas(locais, colunas, linhas):
     buf.seek(0)
     return buf
 
+# =====================================================================================
+# ORDEM DE CARREGAMENTO: FUNÇÕES
+# =====================================================================================
+def ler_base_inventario(arquivos):
+    """
+    Lê um ou mais Excel de inventário (gerados pelo Leitor de Mão ou pelo App Celular)
+    e devolve:
+      - base: {lote: [localizações]}
+      - datas: lista de datas do inventário encontradas (aba 'Info' do Leitor de Mão)
+    """
+    base = {}
+    datas = []
+    for arq in arquivos:
+        abas = pd.read_excel(arq, sheet_name=None, dtype=str)
+        df = abas.get("Inventario Geral")
+        if df is None or "Lote" not in df.columns or "Localização" not in df.columns:
+            raise ValueError(f'O arquivo "{arq.name}" não tem a aba "Inventario Geral" com as colunas Lote e Localização.')
+
+        for lote, local in zip(df["Lote"], df["Localização"]):
+            if pd.isna(lote) or pd.isna(local):
+                continue
+            lote, local = str(lote).strip(), str(local).strip()
+            if not lote or not local or local == "SEM LOCALIZAÇÃO":
+                continue
+            base.setdefault(lote, [])
+            if local not in base[lote]:
+                base[lote].append(local)
+
+        info = abas.get("Info")
+        if info is not None and "Data do inventário" in info.columns and not info.empty:
+            datas.append(str(info["Data do inventário"].iloc[0]).strip())
+    return base, datas
+
+
+def buscar_local(base, lote):
+    """Procura o lote na base (também tenta com zeros à esquerda, caso algum tenha se perdido)."""
+    if lote in base:
+        return base[lote]
+    if lote.isdigit():
+        for chave in (lote.lstrip("0"), lote.zfill(11)):
+            if chave in base:
+                return base[chave]
+    return []
+
+
+def ler_ordem_carregamento(arquivo):
+    """
+    Lê o PDF 'Pick-list de Carregamento' do Protheus e devolve:
+      - cab: {'precarga', 'carga'}
+      - itens: lista com seq, descrição, qtd, lote, cliente e a posição da coluna 'Localizac'
+    """
+    import re
+    import pdfplumber
+    from collections import defaultdict
+
+    itens, cab = [], {}
+    with pdfplumber.open(arquivo) as pdf:
+        for num_pag, pag in enumerate(pdf.pages):
+            palavras = pag.extract_words()
+            linhas = defaultdict(list)
+            for w in palavras:
+                linhas[round(w["top"])].append(w)
+
+            col_loc = [w for w in palavras if w["text"] == "Localizac"]
+            col_cli = [w for w in palavras if w["text"] == "Cliente"]
+            col_mun = [w for w in palavras if w["text"] == "Municipio"]
+            topos = sorted(linhas)
+
+            for i, topo in enumerate(topos):
+                lw = sorted(linhas[topo], key=lambda w: w["x0"])
+                textos = [w["text"] for w in lw]
+
+                # Cabeçalho: a linha de baixo do "Pre-Car" tem os números
+                if "Pre-Car" in textos and i + 1 < len(topos):
+                    valores = sorted(linhas[topos[i + 1]], key=lambda w: w["x0"])
+                    if len(valores) >= 2:
+                        cab = {"precarga": valores[0]["text"], "carga": valores[1]["text"]}
+
+                # Linha de item: começa com Seq de 3 dígitos e tem um lote de 11 dígitos
+                if not col_loc or not re.fullmatch(r"\d{3}", textos[0]):
+                    continue
+                x0_loc, x1_loc = col_loc[0]["x0"], col_loc[0]["x1"]
+                lotes = [w for w in lw if re.fullmatch(r"\d{11}", w["text"]) and w["x0"] > x1_loc]
+                if not lotes:
+                    continue
+                antes = [w for w in lw if w["x0"] < x0_loc]   # Seq, Descrição, Qtd Embarca, Qtd Peças
+                cliente = ""
+                if col_cli and col_mun:
+                    cliente = " ".join(w["text"] for w in lw
+                                       if col_cli[0]["x0"] - 2 <= w["x0"] < col_mun[0]["x0"] - 2)
+                itens.append({
+                    "pagina": num_pag, "seq": textos[0],
+                    "desc": " ".join(w["text"] for w in antes[1:-2]),
+                    "qtd": antes[-2]["text"] if len(antes) >= 3 else "",
+                    "lote": lotes[0]["text"], "cliente": cliente,
+                    "x0": x0_loc, "x1": x1_loc, "top": lw[0]["top"], "bottom": lw[0]["bottom"],
+                })
+    return cab, itens
+
+
+def carimbar_ordem(arquivo, itens, base):
+    """Escreve a localização por cima do '_________' da coluna Localizac. Sem localização = fica em branco."""
+    from pypdf import PdfReader, PdfWriter
+    from reportlab.pdfgen import canvas
+    from collections import defaultdict
+
+    arquivo.seek(0)
+    leitor = PdfReader(arquivo)
+    saida = PdfWriter()
+    por_pagina = defaultdict(list)
+    for it in itens:
+        por_pagina[it["pagina"]].append(it)
+
+    for num_pag, pagina in enumerate(leitor.pages):
+        larg, alt = float(pagina.mediabox.width), float(pagina.mediabox.height)
+        buf = io.BytesIO()
+        c = canvas.Canvas(buf, pagesize=(larg, alt))
+        escreveu = False
+        for it in por_pagina.get(num_pag, []):
+            locais = buscar_local(base, it["lote"])
+            if not locais:
+                continue
+            escreveu = True
+            texto = " / ".join(locais)
+            y = alt - it["bottom"]
+            largura_col = it["x1"] - it["x0"]
+            # Tampa o "_________" com um retângulo branco
+            c.setFillColorRGB(1, 1, 1)
+            c.rect(it["x0"] - 2, y - 1.5, largura_col + 4, it["bottom"] - it["top"] + 3, stroke=0, fill=1)
+            # Diminui a fonte se o texto não couber
+            tam = 8.5
+            while c.stringWidth(texto, "Helvetica-Bold", tam) > largura_col + 8 and tam > 5:
+                tam -= 0.5
+            c.setFillColorRGB(0, 0, 0)
+            c.setFont("Helvetica-Bold", tam)
+            c.drawString(it["x0"] - 1, y + 0.5, texto)
+        c.save()
+        if escreveu:
+            buf.seek(0)
+            pagina.merge_page(PdfReader(buf).pages[0])
+        saida.add_page(pagina)
+    return saida
+
+
+def gerar_roteiro(cab, itens, base, data_base):
+    """Folha 'Roteiro de Separação': itens agrupados por localização, sem localização no final."""
+    from pypdf import PdfReader
+    from collections import defaultdict
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.lib.units import mm
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=landscape(A4), leftMargin=12 * mm, rightMargin=12 * mm,
+                            topMargin=10 * mm, bottomMargin=10 * mm)
+    estilos = getSampleStyleSheet()
+    elementos = []
+
+    n_ok = sum(1 for it in itens if buscar_local(base, it["lote"]))
+    elementos.append(Paragraph(
+        f"<b>ROTEIRO DE SEPARAÇÃO</b> &nbsp;&nbsp; Carga {cab.get('carga', '')} &nbsp;·&nbsp; "
+        f"Pré-carga {cab.get('precarga', '')}", estilos["Title"]))
+    elementos.append(Paragraph(
+        f"{len(itens)} itens · {n_ok} localizados · {len(itens) - n_ok} sem localização "
+        f"&nbsp;&nbsp;|&nbsp;&nbsp; <i>Localizações conforme inventário de {data_base}</i>", estilos["Normal"]))
+    elementos.append(Spacer(1, 6))
+
+    SEM = "~SEM"  # chave que fica por último na ordenação
+    grupos = defaultdict(list)
+    for it in itens:
+        locais = buscar_local(base, it["lote"])
+        grupos[locais[0] if locais else SEM].append((it, locais))
+
+    dados = [["Localização", "Seq.", "Lote", "Descrição", "Qtd (t)", "Cliente", "OK"]]
+    estilo = [
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f2937")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]
+    linha = 1
+    for chave in sorted(grupos):
+        inicio = linha
+        for k, (it, locais) in enumerate(grupos[chave]):
+            rotulo = ("SEM LOCALIZAÇÃO" if chave == SEM else chave) if k == 0 else ""
+            desc = it["desc"]
+            if len(locais) > 1:
+                desc += f"  (também em {' / '.join(locais[1:])})"
+            dados.append([rotulo, it["seq"], it["lote"], desc, it["qtd"], it["cliente"], ""])
+            linha += 1
+        if chave == SEM:
+            estilo.append(("BACKGROUND", (0, inicio), (-1, linha - 1), colors.HexColor("#FFE8CC")))
+        estilo.append(("LINEBELOW", (0, linha - 1), (-1, linha - 1), 1.2, colors.black))
+        estilo.append(("FONTNAME", (0, inicio), (0, linha - 1), "Helvetica-Bold"))
+
+    tabela = Table(dados, colWidths=[38 * mm, 14 * mm, 30 * mm, 80 * mm, 18 * mm, 60 * mm, 12 * mm],
+                   repeatRows=1)
+    tabela.setStyle(TableStyle(estilo))
+    elementos.append(tabela)
+    doc.build(elementos)
+    buf.seek(0)
+    return PdfReader(buf)
+
 
 # =====================================================================================
 # INTERFACE DO STREAMLIT (UI)
@@ -507,7 +714,8 @@ st.set_page_config(page_title="Conversor de Inventário Dox", layout="wide")
 st.title("Conversor de Inventário Unificado")
 st.markdown("---")
 
-aba_celular, aba_mao, aba_etiquetas = st.tabs(["📱 App Celular", "🔫 Leitor de Mão", "🏷️ Etiquetas de Localização"])
+aba_celular, aba_mao, aba_etiquetas, aba_ordem = st.tabs(
+    ["📱 App Celular", "🔫 Leitor de Mão", "🏷️ Etiquetas de Localização", "🚚 Ordem de Carregamento"])
 
 # =====================================================================================
 # ABA 1: APP CELULAR (sem alterações)
@@ -808,4 +1016,148 @@ with aba_etiquetas:
                 st.markdown(f"<div style='font-size:24px;font-weight:700;margin-top:-8px'>{local}</div>",
                             unsafe_allow_html=True)
         if len(res_e["locais"]) > LIMITE_PREVIA:
-            st.caption(f"Mostrando {LIMITE_PREVIA} de {len(res_e['locais'])}. O PDF contém todas.")                    
+            st.caption(f"Mostrando {LIMITE_PREVIA} de {len(res_e['locais'])}. O PDF contém todas.") 
+
+# =====================================================================================
+# ABA 4: ORDEM DE CARREGAMENTO
+# =====================================================================================
+with aba_ordem:
+    if 'uploader_key_ordem' not in st.session_state:
+        st.session_state.uploader_key_ordem = 0
+
+    def limpar_lista_ordem():
+        st.session_state.uploader_key_ordem += 1
+        st.session_state.pop("resultado_ordem", None)
+
+    with st.expander("ℹ️ Como usar a Ordem de Carregamento", expanded=False):
+        st.markdown(
+            "1. Anexe um ou mais PDFs de **Pick-list de Carregamento** gerados no Protheus.\n"
+            "2. Anexe o **Excel do inventário** (convertido na aba Leitor de Mão ou App Celular). "
+            "Pode anexar mais de um, se o inventário foi feito em partes.\n"
+            "3. Clique em **Preencher Ordens** e baixe o PDF.\n\n"
+            "📄 O PDF final traz, para cada carga: a **ordem original com a localização preenchida** "
+            "na coluna *Localizac* e logo depois o **Roteiro de Separação**, com os itens agrupados por local.\n\n"
+            "✏️ Lotes que não estão no inventário ficam com a localização **em branco**, para o "
+            "conferente preencher à mão. No roteiro eles aparecem no final, em laranja."
+        )
+
+    col1_o, col2_o = st.columns([1, 1])
+    with col1_o:
+        ordens_pdf = st.file_uploader(
+            "1️⃣ Ordens de Carregamento (.pdf)", type="pdf", accept_multiple_files=True,
+            key=f"ordens_{st.session_state.uploader_key_ordem}",
+            help="PDFs 'Pick-list de Carregamento' do Protheus. Pode anexar várias ordens de uma vez."
+        )
+    with col2_o:
+        bases_inv = st.file_uploader(
+            "2️⃣ Base do inventário (.xlsx)", type="xlsx", accept_multiple_files=True,
+            key=f"base_{st.session_state.uploader_key_ordem}",
+            help="Excel convertido nas abas Leitor de Mão ou App Celular (aba 'Inventario Geral'). "
+                 "Use sempre o inventário mais recente."
+        )
+
+    col_nome_o, col_data_o = st.columns([1, 1])
+    with col_nome_o:
+        nome_pdf_ordem = st.text_input(
+            "Nome do PDF final (sem .pdf):", value="", key="nome_ordem",
+            help='Se ficar em branco, será salvo como "Ordens_Preenchidas.pdf".')
+    with col_data_o:
+        data_manual = st.text_input(
+            "Data do inventário (só se não for preenchida sozinha):", value="", key="data_manual",
+            placeholder="DD/MM/AAAA",
+            help="Excel gerado pela aba Leitor de Mão já traz a data gravada. Para arquivos antigos "
+                 "ou do App Celular, digite aqui a data em que o inventário foi feito.")
+
+    if ordens_pdf or bases_inv:
+        col_msg_o, col_btn_o = st.columns([3, 1])
+        with col_msg_o:
+            st.info(f"📂 **{len(ordens_pdf or [])} ordem(ns)** e **{len(bases_inv or [])} base(s)** anexadas.")
+        with col_btn_o:
+            st.button("🗑️ Limpar Lista", on_click=limpar_lista_ordem, type="secondary",
+                      use_container_width=True, key="limpar_ordem")
+
+    st.markdown("###")
+    if st.button("Preencher Ordens", type="primary", key="preencher_ordem"):
+        if not ordens_pdf:
+            st.warning("⚠️ Anexe pelo menos uma Ordem de Carregamento (.pdf).")
+        elif not bases_inv:
+            st.warning("⚠️ Anexe o Excel do inventário para buscar as localizações.")
+        else:
+            with st.spinner("Lendo ordens e buscando localizações..."):
+                try:
+                    from pypdf import PdfWriter
+                    base, datas = ler_base_inventario(bases_inv)
+
+                    # Data que vai no roteiro
+                    datas = sorted(set(d for d in datas if d))
+                    if data_manual.strip():
+                        data_base = data_manual.strip()
+                    elif len(datas) == 1:
+                        data_base = datas[0]
+                    elif len(datas) > 1:
+                        data_base = " / ".join(datas)
+                    else:
+                        data_base = "data não informada"
+
+                    pdf_final = PdfWriter()
+                    resumo = []
+                    for arq in ordens_pdf:
+                        pdf_bytes = arq.getvalue()
+                        cab, itens = ler_ordem_carregamento(io.BytesIO(pdf_bytes))
+                        if not itens:
+                            st.warning(f"⚠️ Não encontrei itens no arquivo **{arq.name}**. "
+                                       "Confira se é um Pick-list de Carregamento do Protheus.")
+                            continue
+                        for pagina in carimbar_ordem(io.BytesIO(pdf_bytes), itens, base).pages:
+                            pdf_final.add_page(pagina)
+                        for pagina in gerar_roteiro(cab, itens, base, data_base).pages:
+                            pdf_final.add_page(pagina)
+
+                        n_ok = sum(1 for it in itens if buscar_local(base, it["lote"]))
+                        clientes = list(dict.fromkeys(it["cliente"] for it in itens if it["cliente"]))
+                        resumo.append({
+                            "Carga": cab.get("carga", ""), "Pré-carga": cab.get("precarga", ""),
+                            "Cliente(s)": ", ".join(clientes), "Itens": len(itens),
+                            "Localizados": n_ok, "Sem localização": len(itens) - n_ok,
+                        })
+
+                    if resumo:
+                        buf_pdf = io.BytesIO()
+                        pdf_final.write(buf_pdf)
+                        st.session_state.resultado_ordem = {
+                            "pdf": buf_pdf.getvalue(),
+                            "nome": f"{nome_pdf_ordem.strip() or 'Ordens_Preenchidas'}.pdf",
+                            "resumo": pd.DataFrame(resumo),
+                            "data_base": data_base,
+                            "lotes_base": len(base),
+                        }
+                    else:
+                        st.session_state.pop("resultado_ordem", None)
+                except Exception as e:
+                    st.error(f"Ocorreu um erro: {e}")
+
+    # --- RESULTADO ---
+    res_o = st.session_state.get("resultado_ordem")
+    if res_o:
+        df_res = res_o["resumo"]
+        st.success(f"✅ {len(df_res)} ordem(ns) preenchida(s). Base com {res_o['lotes_base']} lotes "
+                   f"(inventário de {res_o['data_base']}).")
+
+        st.subheader("📊 Resumo")
+        r1, r2, r3, r4 = st.columns(4)
+        r1.metric("Cargas", len(df_res), help="Quantidade de ordens de carregamento lidas.")
+        r2.metric("Itens", int(df_res["Itens"].sum()), help="Total de linhas (lotes) somando todas as ordens.")
+        r3.metric("Localizados", int(df_res["Localizados"].sum()),
+                  help="Lotes encontrados no inventário. A localização foi escrita na ordem.")
+        r4.metric("Sem localização", int(df_res["Sem localização"].sum()),
+                  help="Lotes que não estão no inventário. Ficam em branco para o conferente preencher.")
+
+        st.dataframe(
+            df_res.style.apply(
+                lambda r: ["background-color: #FFE8CC" if r["Sem localização"] > 0 else ""] * len(r), axis=1),
+            hide_index=True, use_container_width=True)
+        st.caption("🟧 Cargas com algum lote sem localização. O PDF traz, para cada carga, a ordem "
+                   "preenchida seguida do Roteiro de Separação.")
+
+        st.download_button("📥 Baixar PDF das Ordens", data=res_o["pdf"], file_name=res_o["nome"],
+                           mime="application/pdf", key="baixar_ordem")                               
