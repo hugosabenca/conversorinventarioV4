@@ -362,7 +362,7 @@ def gerar_excel_leitor(df, df_locais, data_inventario=""):
     """Monta o Excel final: aba 'Inventario Geral' (com cores) + aba 'Itens por Localização' + aba 'Info'."""
     from openpyxl.styles import PatternFill, Font
 
-    colunas = ["Filial", "Código", "Armazém", "Lote", "Peso", "Localização", "Observação"]
+    colunas = ["Filial", "Código", "Descrição", "Armazém", "Lote", "Peso", "Localização", "Observação"]
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df[colunas].to_excel(writer, index=False, sheet_name="Inventario Geral")
@@ -374,10 +374,9 @@ def gerar_excel_leitor(df, df_locais, data_inventario=""):
         ws.freeze_panes = "A2"
 
         for i, (status, dup) in enumerate(zip(df["_status"], df["_dup"]), start=2):
-            # Colunas de texto ficam como TEXTO (mantém zeros à esquerda)
-            for col in (1, 2, 3, 4, 6, 7):
-                ws.cell(row=i, column=col).number_format = "@"
-            ws.cell(row=i, column=5).number_format = "0.000"
+            # Colunas de texto ficam como TEXTO (mantém zeros à esquerda); Peso com 3 casas
+            for col, nome in enumerate(colunas, start=1):
+                ws.cell(row=i, column=col).number_format = "0.000" if nome == "Peso" else "@"
 
             cor = cor_da_linha(status, dup)
             if cor:
@@ -497,6 +496,27 @@ def gerar_pdf_etiquetas(locais, colunas, linhas):
     c.save()
     buf.seek(0)
     return buf
+
+# =====================================================================================
+# DESCRIÇÃO DOS PRODUTOS (aba "Dados_Produtos" atualizada pelo robô)
+# =====================================================================================
+ID_PLANILHA_SISTEMA = "1jODOp_SJUKWp1UaSmW_xJgkkyqDUexa56_P5QScAv3s"
+ABA_PRODUTOS = "Dados_Produtos"
+
+@st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
+def carregar_produtos():
+    """
+    Lê a lista código -> descrição da planilha do robô.
+    Fica guardada na memória por 6 horas: só a 1ª conversão nesse período consulta o Google.
+    Se der erro, NÃO guarda (tenta de novo na próxima conversão).
+    """
+    import gspread
+    try:
+        gc = gspread.service_account_from_dict(dict(st.secrets["gcp_service_account"]))
+    except Exception:
+        gc = gspread.service_account(filename="credentials.json")   # quando roda no seu PC
+    valores = gc.open_by_key(ID_PLANILHA_SISTEMA).worksheet(ABA_PRODUTOS).get_all_values()
+    return {str(l[0]).strip(): str(l[1]).strip() for l in valores[1:] if len(l) >= 2 and str(l[0]).strip()}
 
 # =====================================================================================
 # ORDEM DE CARREGAMENTO: FUNÇÕES
@@ -887,6 +907,24 @@ with aba_mao:
                     if dfs:
                         df_mao = marcar_duplicados(pd.concat(dfs, ignore_index=True))
                         df_locais = resumo_por_local(df_mao)
+
+                        # Descrição do produto (lista vinda do Protheus via robô)
+                        aviso_desc = ""
+                        try:
+                            produtos = carregar_produtos()
+                        except Exception:
+                            produtos = None
+                            aviso_desc = ("Não consegui ler a lista de produtos do Protheus agora. "
+                                          "O arquivo foi gerado com a coluna Descrição em branco.")
+                        df_mao.insert(2, "Descrição",
+                                      df_mao["Código"].map(produtos).fillna("") if produtos else "")
+                        if produtos:
+                            sem_desc = sorted(set(df_mao.loc[(df_mao["Código"] != "") &
+                                                             (df_mao["Descrição"] == ""), "Código"]))
+                            if sem_desc:
+                                aviso_desc = (f"{len(sem_desc)} código(s) sem descrição (produto novo ou "
+                                              f"código lido errado): {', '.join(sem_desc[:10])}"
+                                              + (" ..." if len(sem_desc) > 10 else ""))
                         nome = nome_arquivo_mao.strip() or "Inventario_LeitorMao"
                         st.session_state.resultado_mao = {
                             "df": df_mao,
@@ -895,6 +933,7 @@ with aba_mao:
                                                         data_inventario.strftime("%d/%m/%Y")).getvalue(),
                             "nome": f"{nome}.xlsx",
                             "qtd_arquivos": len(dfs),
+                            "aviso_desc": aviso_desc,
                         }
                     else:
                         st.session_state.pop("resultado_mao", None)
@@ -906,6 +945,8 @@ with aba_mao:
     if res:
         df_mao = res["df"]
         st.success(f"✅ Conversão concluída! {res['qtd_arquivos']} arquivo(s) processado(s).")
+        if res.get("aviso_desc"):
+            st.warning(f"⚠️ {res['aviso_desc']}")
 
         st.subheader("📊 Resumo da conversão")
         m1, m2, m3, m4, m5 = st.columns(5)
@@ -939,7 +980,7 @@ with aba_mao:
 
         st.markdown("#### 👀 Prévia do arquivo")
         st.caption("🟨 Lote lido mais de uma vez · 🟧 Sem localização · 🟥 Leitura fora do padrão")
-        colunas_vis = ["Filial", "Código", "Armazém", "Lote", "Peso", "Localização", "Observação"]
+        colunas_vis = ["Filial", "Código", "Descrição", "Armazém", "Lote", "Peso", "Localização", "Observação"]
 
         def _colorir(row):
             cor = cor_da_linha(df_mao.at[row.name, "_status"], df_mao.at[row.name, "_dup"])
