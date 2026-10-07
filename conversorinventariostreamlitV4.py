@@ -561,7 +561,7 @@ def ler_ordem_carregamento(arquivo):
             for w in palavras:
                 linhas[round(w["top"])].append(w)
 
-            col_loc = [w for w in palavras if w["text"] == "Localizac"]
+            col_loc = [w for w in palavras if w["text"].startswith("Localiza")]
             col_cli = [w for w in palavras if w["text"] == "Cliente"]
             col_mun = [w for w in palavras if w["text"] == "Municipio"]
             topos = sorted(linhas)
@@ -571,7 +571,7 @@ def ler_ordem_carregamento(arquivo):
                 textos = [w["text"] for w in lw]
 
                 # Cabeçalho: a linha de baixo do "Pre-Car" tem os números
-                if "Pre-Car" in textos and i + 1 < len(topos):
+                if any(t.startswith("Pre-Car") for t in textos) and i + 1 < len(topos):
                     valores = sorted(linhas[topos[i + 1]], key=lambda w: w["x0"])
                     if len(valores) >= 2:
                         cab = {"precarga": valores[0]["text"], "carga": valores[1]["text"]}
