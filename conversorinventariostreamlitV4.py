@@ -358,8 +358,8 @@ def resumo_por_local(df):
     return pd.DataFrame({"Localização": ordem, "Itens": [int(qtd[l]) for l in ordem]})
 
 
-def gerar_excel_leitor(df, df_locais):
-    """Monta o Excel final: aba 'Inventario Geral' (com cores) + aba 'Itens por Localização'."""
+def gerar_excel_leitor(df, df_locais, data_inventario=""):
+    """Monta o Excel final: aba 'Inventario Geral' (com cores) + aba 'Itens por Localização' + aba 'Info'."""
     from openpyxl.styles import PatternFill, Font
 
     colunas = ["Filial", "Código", "Armazém", "Lote", "Peso", "Localização", "Observação"]
@@ -404,6 +404,14 @@ def gerar_excel_leitor(df, df_locais):
         total = len(df_locais) + 2
         ws2.cell(row=total, column=1, value="Total").font = Font(bold=True)
         ws2.cell(row=total, column=2, value=int(df_locais["Itens"].sum())).font = Font(bold=True)
+
+        # Aba 3: informações do inventário (usada pela aba Ordem de Carregamento)
+        pd.DataFrame({"Data do inventário": [data_inventario],
+                      "Gerado em": [datetime.now().strftime("%d/%m/%Y %H:%M")]}
+                     ).to_excel(writer, index=False, sheet_name="Info")
+        ws3 = writer.sheets["Info"]
+        ws3.column_dimensions["A"].width = 20
+        ws3.column_dimensions["B"].width = 20
 
     output.seek(0)
     return output
@@ -644,6 +652,11 @@ with aba_mao:
             "Nome do Arquivo Final (sem .xlsx):", value="", key="nome_mao",
             help='Se ficar em branco, o arquivo será salvo como "Inventario_LeitorMao.xlsx".'
         )
+        data_inventario = st.date_input(
+            "Data do inventário:", value=datetime.now().date(), format="DD/MM/YYYY", key="data_inv",
+            help="Dia em que as leituras foram feitas. Fica gravada no Excel e aparece no Roteiro de "
+                 "Separação da aba Ordem de Carregamento."
+        )
 
     st.markdown("###")
     if st.button("Converter Planilhas", type="primary", key="converter_mao"):
@@ -670,7 +683,8 @@ with aba_mao:
                         st.session_state.resultado_mao = {
                             "df": df_mao,
                             "locais": df_locais,
-                            "excel": gerar_excel_leitor(df_mao, df_locais).getvalue(),
+                            "excel": gerar_excel_leitor(df_mao, df_locais,
+                                                        data_inventario.strftime("%d/%m/%Y")).getvalue(),
                             "nome": f"{nome}.xlsx",
                             "qtd_arquivos": len(dfs),
                         }
