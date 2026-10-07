@@ -15,3 +15,4 @@ segno
 reportlab
 pdfplumber
 pypdf
+gspread
