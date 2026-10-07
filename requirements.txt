@@ -13,3 +13,5 @@ python-docx
 pdfplumber
 segno
 reportlab
+pdfplumber
+pypdf
