@@ -1485,7 +1485,7 @@ with aba_ordem:
     if res_o:
         df_res = res_o["resumo"]
         st.success(f"✅ {len(df_res)} ordem(ns) preenchida(s). Base com {res_o['lotes_base']} lotes "
-                   f"({res_o['origem_txt']}).")
+                   f"({res_o.get('origem_txt', '')}).")
 
         st.subheader("📊 Resumo")
         r1, r2, r3, r4 = st.columns(4)
