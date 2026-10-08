@@ -358,7 +358,7 @@ def resumo_por_local(df):
     return pd.DataFrame({"Localização": ordem, "Itens": [int(qtd[l]) for l in ordem]})
 
 
-def gerar_excel_leitor(df, df_locais, data_inventario=""):
+def gerar_excel_leitor(df, df_locais, data_inventario="", comparacao=None):
     """Monta o Excel final: aba 'Inventario Geral' (com cores) + aba 'Itens por Localização' + aba 'Info'."""
     from openpyxl.styles import PatternFill, Font
 
@@ -411,6 +411,25 @@ def gerar_excel_leitor(df, df_locais, data_inventario=""):
         ws3 = writer.sheets["Info"]
         ws3.column_dimensions["A"].width = 20
         ws3.column_dimensions["B"].width = 20
+
+        # Abas 4 e 5: comparação com o estoque (só se a opção foi marcada)
+        if comparacao:
+            for nome_aba, chave, cor in (("Falta", "falta", COR_ERRO), ("Sobra", "sobra", "DBEAFE")):
+                tabela = comparacao[chave]
+                tabela.to_excel(writer, index=False, sheet_name=nome_aba)
+                wsx = writer.sheets[nome_aba]
+                for cell in wsx[1]:
+                    cell.font = Font(bold=True)
+                wsx.freeze_panes = "A2"
+                fill = PatternFill(start_color=cor, end_color=cor, fill_type="solid")
+                for i in range(2, len(tabela) + 2):
+                    for j, nome_col in enumerate(tabela.columns, start=1):
+                        c = wsx.cell(row=i, column=j)
+                        c.fill = fill
+                        c.number_format = "0.000" if "(t)" in nome_col else "@"
+                for col in wsx.columns:
+                    larg = max((len(str(c.value)) for c in col if c.value is not None), default=0)
+                    wsx.column_dimensions[get_column_letter(col[0].column)].width = min(larg + 4, 60)
 
     output.seek(0)
     return output
@@ -517,6 +536,85 @@ def carregar_produtos():
         gc = gspread.service_account(filename="credentials.json")   # quando roda no seu PC
     valores = gc.open_by_key(ID_PLANILHA_SISTEMA).worksheet(ABA_PRODUTOS).get_all_values()
     return {str(l[0]).strip(): str(l[1]).strip() for l in valores[1:] if len(l) >= 2 and str(l[0]).strip()}
+
+# =====================================================================================
+# COMPARAÇÃO COM O ESTOQUE DO PROTHEUS (aba "Dados_Estoque" atualizada pelo robô)
+# =====================================================================================
+@st.cache_data(ttl=10 * 60, show_spinner=False)
+def carregar_estoque():
+    """
+    Lê o estoque (Dados_Estoque) e a hora em que o robô o atualizou (Status_Robo!B2),
+    numa única chamada ao Google. Fica guardado por 10 minutos.
+    """
+    import gspread
+    try:
+        gc = gspread.service_account_from_dict(dict(st.secrets["gcp_service_account"]))
+    except Exception:
+        gc = gspread.service_account(filename="credentials.json")   # quando roda no seu PC
+    blocos = gc.open_by_key(ID_PLANILHA_SISTEMA).values_batch_get(["Dados_Estoque", "Status_Robo!B2"])
+    faixas = blocos.get("valueRanges", [])
+    valores = faixas[0].get("values", []) if faixas else []
+    hora = ""
+    if len(faixas) > 1 and faixas[1].get("values"):
+        hora = str(faixas[1]["values"][0][0])
+    if not valores:
+        return pd.DataFrame(), hora
+    cab = valores[0]
+    linhas = [l + [""] * (len(cab) - len(l)) for l in valores[1:]]
+    return pd.DataFrame(linhas, columns=cab), hora
+
+
+def formatar_ton(v):
+    """Mostra o peso com 3 casas e vírgula (ex: 1,338). Vazio se não tiver valor."""
+    return "" if pd.isna(v) else f"{v:.3f}".replace(".", ",")
+
+
+def comparar_com_estoque(df_mao, estoque):
+    """
+    Cruza os lotes lidos com o estoque do Protheus da(s) mesma(s) filial(is) das etiquetas.
+      - Falta: está no Protheus e não foi lido
+      - Sobra: foi lido e não está no Protheus
+    """
+    itens = df_mao[df_mao["_status"] != "erro"]
+    filiais = sorted(set(f for f in itens["Filial"] if f))
+    prefixos = tuple(f"{f}-" for f in filiais)
+
+    est = estoque.copy()
+    for col in ("FILIAL", "LOTE", "COD", "PRODUTO", "ARMAZEM", "QTDE", "DIAS.ESTOQUE"):
+        if col not in est.columns:
+            est[col] = ""
+        est[col] = est[col].astype(str).str.strip()
+    est = est[est["FILIAL"].str.startswith(prefixos) & (est["LOTE"] != "")]
+    est = est.drop_duplicates(subset=["LOTE", "ARMAZEM"])
+
+    lotes_protheus = set(est["LOTE"])
+    lotes_lidos = set(l for l in itens["Lote"] if l)
+    encontrados = lotes_lidos & lotes_protheus
+    falta = lotes_protheus - lotes_lidos
+    sobra = lotes_lidos - lotes_protheus
+
+    df_falta = est[est["LOTE"].isin(falta)].copy()
+    df_falta["QTDE"] = pd.to_numeric(df_falta["QTDE"].str.replace(",", "."), errors="coerce")
+    df_falta = df_falta.rename(columns={"LOTE": "Lote", "COD": "Código", "PRODUTO": "Descrição",
+                                        "ARMAZEM": "Armazém", "QTDE": "Saldo Protheus (t)",
+                                        "DIAS.ESTOQUE": "Entrada no estoque"})
+    df_falta = df_falta[["Lote", "Código", "Descrição", "Armazém", "Saldo Protheus (t)",
+                         "Entrada no estoque"]].sort_values(["Armazém", "Lote"])
+
+    df_sobra = itens[itens["Lote"].isin(sobra)]
+    df_sobra = (df_sobra.groupby("Lote", sort=False)
+                .agg({"Código": "first", "Descrição": "first", "Peso": "first",
+                      "Localização": lambda x: " / ".join(dict.fromkeys(x))})
+                .reset_index()[["Lote", "Código", "Descrição", "Peso", "Localização"]]
+                .rename(columns={"Peso": "Peso lido (t)"}))
+
+    return {
+        "filiais": filiais,
+        "n_protheus": len(lotes_protheus), "n_lidos": len(lotes_lidos),
+        "n_encontrados": len(encontrados), "n_falta": len(falta), "n_sobra": len(sobra),
+        "acuracidade": (len(encontrados) / len(lotes_protheus) * 100) if lotes_protheus else None,
+        "falta": df_falta.reset_index(drop=True), "sobra": df_sobra,
+    }
 
 # =====================================================================================
 # ORDEM DE CARREGAMENTO: FUNÇÕES
@@ -866,6 +964,12 @@ with aba_mao:
             help="Planilhas Excel geradas pelo leitor de mão. Pode anexar várias de uma vez. "
                  "Cada planilha começa sem localização: leia o QR do local antes dos itens."
         )
+        comparar_estoque = st.checkbox(
+            "🔍 Comparar com o estoque do Protheus", value=False, key="comparar_est",
+            help="Cruza os lotes lidos com o estoque do Protheus (aba Dados_Estoque, atualizada pelo robô) "
+                 "da mesma filial das etiquetas, todos os armazéns. Mostra o que está no sistema e não "
+                 "foi lido (Falta) e o que foi lido e não está no sistema (Sobra).")
+        st.caption("Deixe desmarcado quando for só uma releitura de área para atualizar localização.")
         if arquivos_mao:
             col_msg_m, col_btn_m = st.columns([3, 1])
             with col_msg_m:
@@ -925,15 +1029,29 @@ with aba_mao:
                                 aviso_desc = (f"{len(sem_desc)} código(s) sem descrição (produto novo ou "
                                               f"código lido errado): {', '.join(sem_desc[:10])}"
                                               + (" ..." if len(sem_desc) > 10 else ""))
+                        # Comparação com o estoque (opcional)
+                        comparacao, aviso_estoque, hora_estoque = None, "", ""
+                        if comparar_estoque:
+                            try:
+                                estoque, hora_estoque = carregar_estoque()
+                                comparacao = comparar_com_estoque(df_mao, estoque)
+                            except Exception:
+                                aviso_estoque = ("Não consegui ler o estoque do Protheus agora. "
+                                                 "A conversão foi feita sem a comparação.")
+
                         nome = nome_arquivo_mao.strip() or "Inventario_LeitorMao"
                         st.session_state.resultado_mao = {
                             "df": df_mao,
                             "locais": df_locais,
                             "excel": gerar_excel_leitor(df_mao, df_locais,
-                                                        data_inventario.strftime("%d/%m/%Y")).getvalue(),
+                                                        data_inventario.strftime("%d/%m/%Y"),
+                                                        comparacao).getvalue(),
                             "nome": f"{nome}.xlsx",
                             "qtd_arquivos": len(dfs),
                             "aviso_desc": aviso_desc,
+                            "comparacao": comparacao,
+                            "aviso_estoque": aviso_estoque,
+                            "hora_estoque": hora_estoque,
                         }
                     else:
                         st.session_state.pop("resultado_mao", None)
@@ -991,6 +1109,43 @@ with aba_mao:
         st.dataframe(df_vis.style.apply(_colorir, axis=1), hide_index=True, use_container_width=True)
         st.caption("O Excel baixado sai com as mesmas cores, a coluna Observação e uma segunda aba "
                    "com os itens por localização.")
+
+        # --- COMPARAÇÃO COM O ESTOQUE ---
+        if res.get("aviso_estoque"):
+            st.warning(f"⚠️ {res['aviso_estoque']}")
+        comp = res.get("comparacao")
+        if comp:
+            st.subheader("🔍 Comparação com o estoque do Protheus")
+            hora_txt = (f" · Estoque do Protheus copiado pelo robô em **{res['hora_estoque']}**"
+                        if res.get("hora_estoque") else "")
+            st.info(f"Filial **{', '.join(comp['filiais']) or '—'}**, todos os armazéns{hora_txt}. "
+                    "Movimentações feitas durante o inventário (faturamento, produção, transferências) "
+                    "podem gerar divergências que não são erro.")
+            c1, c2, c3, c4, c5, c6 = st.columns(6)
+            c1.metric("Lotes no Protheus", comp["n_protheus"],
+                      help="Lotes com saldo no Protheus na filial das etiquetas.")
+            c2.metric("Lotes lidos", comp["n_lidos"], help="Lotes diferentes lidos no inventário.")
+            c3.metric("Encontrados", comp["n_encontrados"],
+                      help="Lotes que estão no Protheus e foram lidos.")
+            c4.metric("Falta", comp["n_falta"],
+                      help="Lotes com saldo no Protheus que não foram lidos no inventário.")
+            c5.metric("Sobra", comp["n_sobra"],
+                      help="Lotes lidos que não estão no estoque do Protheus "
+                           "(material sem entrada, já faturado ou etiqueta errada).")
+            acur = comp["acuracidade"]
+            c6.metric("Acuracidade", f"{acur:.1f}%".replace(".", ",") if acur is not None else "—",
+                      help="Encontrados ÷ Lotes no Protheus.")
+
+            aba_falta, aba_sobra = st.tabs([f"🟥 Falta ({comp['n_falta']})", f"🟦 Sobra ({comp['n_sobra']})"])
+            with aba_falta:
+                st.caption("Lotes com saldo no Protheus que **não foram lidos** no inventário.")
+                st.dataframe(comp["falta"].style.format({"Saldo Protheus (t)": formatar_ton}),
+                             hide_index=True, use_container_width=True)
+            with aba_sobra:
+                st.caption("Lotes **lidos** que não estão no estoque do Protheus, com o local onde foram lidos.")
+                st.dataframe(comp["sobra"].style.format({"Peso lido (t)": formatar_ton}),
+                             hide_index=True, use_container_width=True)
+            st.caption("O Excel baixado ganha as abas **Falta** e **Sobra**.")
 
         st.download_button(
             label="📥 Baixar Excel Consolidado",
