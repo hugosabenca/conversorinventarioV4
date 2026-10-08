@@ -406,7 +406,7 @@ def gerar_excel_leitor(df, df_locais, data_inventario="", comparacao=None):
 
         # Aba 3: informações do inventário (usada pela aba Ordem de Carregamento)
         pd.DataFrame({"Data do inventário": [data_inventario],
-                      "Gerado em": [datetime.now().strftime("%d/%m/%Y %H:%M")]}
+                      "Gerado em": [agora_br().strftime("%d/%m/%Y %H:%M")]}
                      ).to_excel(writer, index=False, sheet_name="Info")
         ws3 = writer.sheets["Info"]
         ws3.column_dimensions["A"].width = 20
@@ -507,8 +507,11 @@ def gerar_pdf_etiquetas(locais, colunas, linhas):
         qr_y = y + espaco_texto + (cel_h - espaco_texto - lado_qr) / 2
         c.drawImage(ImageReader(gerar_qr_png(PREFIXO_LOC + local)), qr_x, qr_y, lado_qr, lado_qr)
 
-        # Nome da localização embaixo
-        c.setFont("Helvetica-Bold", tam_fonte)
+        # Nome da localização embaixo (diminui a fonte se o nome for comprido)
+        tam_nome = tam_fonte
+        while c.stringWidth(local, "Helvetica-Bold", tam_nome) > cel_w * 0.9 and tam_nome > 8:
+            tam_nome -= 1
+        c.setFont("Helvetica-Bold", tam_nome)
         c.setFillColorRGB(0.15, 0.15, 0.2)
         c.drawCentredString(x + cel_w / 2, y + tam_fonte * 0.9, local)
 
@@ -595,17 +598,18 @@ def comparar_com_estoque(df_mao, estoque):
 
     df_falta = est[est["LOTE"].isin(falta)].copy()
     df_falta["QTDE"] = pd.to_numeric(df_falta["QTDE"].str.replace(",", "."), errors="coerce")
-    df_falta = df_falta.rename(columns={"LOTE": "Lote", "COD": "Código", "PRODUTO": "Descrição",
-                                        "ARMAZEM": "Armazém", "QTDE": "Saldo Protheus (t)",
-                                        "DIAS.ESTOQUE": "Entrada no estoque"})
-    df_falta = df_falta[["Lote", "Código", "Descrição", "Armazém", "Saldo Protheus (t)",
-                         "Entrada no estoque"]].sort_values(["Armazém", "Lote"])
+    df_falta["FILIAL"] = df_falta["FILIAL"].str[:2]          # "05-PINHEIRAL" -> "05"
+    df_falta = df_falta.rename(columns={"FILIAL": "Filial", "LOTE": "Lote", "COD": "Código",
+                                        "PRODUTO": "Descrição", "ARMAZEM": "Armazém",
+                                        "QTDE": "Saldo Protheus (t)", "DIAS.ESTOQUE": "Entrada no estoque"})
+    df_falta = df_falta[["Filial", "Armazém", "Lote", "Código", "Descrição", "Saldo Protheus (t)",
+                         "Entrada no estoque"]].sort_values(["Filial", "Armazém", "Lote"])
 
     df_sobra = itens[itens["Lote"].isin(sobra)]
     df_sobra = (df_sobra.groupby("Lote", sort=False)
-                .agg({"Código": "first", "Descrição": "first", "Peso": "first",
-                      "Localização": lambda x: " / ".join(dict.fromkeys(x))})
-                .reset_index()[["Lote", "Código", "Descrição", "Peso", "Localização"]]
+                .agg({"Filial": "first", "Armazém": "first", "Código": "first", "Descrição": "first",
+                      "Peso": "first", "Localização": lambda x: " / ".join(dict.fromkeys(x))})
+                .reset_index()[["Filial", "Armazém", "Lote", "Código", "Descrição", "Peso", "Localização"]]
                 .rename(columns={"Peso": "Peso lido (t)"}))
 
     return {
@@ -615,6 +619,95 @@ def comparar_com_estoque(df_mao, estoque):
         "acuracidade": (len(encontrados) / len(lotes_protheus) * 100) if lotes_protheus else None,
         "falta": df_falta.reset_index(drop=True), "sobra": df_sobra,
     }
+
+# =====================================================================================
+# BASE DE LOCALIZAÇÃO "VIVA" (aba "Base_Localizacao" na planilha Sistema Dox)
+# =====================================================================================
+ABA_BASE_LOC = "Base_Localizacao"
+CABECALHO_BASE_LOC = ["DATA_HORA", "FILIAL", "ARMAZEM", "LOTE", "CODIGO", "LOCALIZACAO", "ORIGEM"]
+DIAS_LEITURA_ANTIGA = 30   # no roteiro, leituras mais velhas que isso ficam em amarelo
+
+
+def agora_br():
+    """Data/hora de Brasília (o servidor do Streamlit Cloud fica em outro fuso)."""
+    from datetime import timezone, timedelta
+    return datetime.now(timezone(timedelta(hours=-3))).replace(tzinfo=None)
+
+
+def _cliente_google():
+    """Conexão com o Google Sheets (Secrets no site; credentials.json quando roda no PC)."""
+    import gspread
+    try:
+        return gspread.service_account_from_dict(dict(st.secrets["gcp_service_account"]))
+    except Exception:
+        return gspread.service_account(filename="credentials.json")
+
+
+def linhas_para_base(df_mao, origem):
+    """Monta as linhas a gravar: só itens válidos e COM localização."""
+    agora = agora_br().strftime("%d/%m/%Y %H:%M:%S")
+    ok = df_mao[(df_mao["_status"] != "erro") & (df_mao["Localização"] != "SEM LOCALIZAÇÃO")]
+    return [[agora, r["Filial"], r["Armazém"], r["Lote"], r["Código"], r["Localização"], origem]
+            for _, r in ok.iterrows()]
+
+
+def gravar_base_localizacao(linhas):
+    """Acrescenta as linhas no final da aba, numa única chamada. Tenta de novo se der 429."""
+    import time
+    from gspread.exceptions import APIError
+    if not linhas:
+        return 0
+    aba = _cliente_google().open_by_key(ID_PLANILHA_SISTEMA).worksheet(ABA_BASE_LOC)
+    for tentativa in range(3):
+        try:
+            aba.append_rows(linhas, value_input_option="RAW")
+            carregar_base_localizacao.clear()   # a próxima consulta já vê as leituras novas
+            return len(linhas)
+        except APIError as e:
+            if ("429" in str(e) or "Quota" in str(e)) and tentativa < 2:
+                time.sleep(20)
+                continue
+            raise
+
+
+def montar_base(valores, hoje=None):
+    """
+    Recebe as linhas da aba (com cabeçalho) e devolve:
+      - base:  {lote: [localizações da leitura MAIS RECENTE]}
+      - lidos: {lote: ("06/10 · há 2 dias", dias)}
+    """
+    hoje = hoje or agora_br()
+    mais_recente = {}   # lote -> (data, [locais])
+    for linha in valores[1:]:
+        if len(linha) < 6:
+            continue
+        data_txt, lote, local = linha[0].strip(), linha[3].strip(), linha[5].strip()
+        if not lote or not local:
+            continue
+        try:
+            data = datetime.strptime(data_txt, "%d/%m/%Y %H:%M:%S")
+        except ValueError:
+            continue
+        atual = mais_recente.get(lote)
+        if atual is None or data > atual[0]:
+            mais_recente[lote] = (data, [local])
+        elif data == atual[0] and local not in atual[1]:
+            atual[1].append(local)            # mesma leitura em 2 locais
+
+    base, lidos = {}, {}
+    for lote, (data, locais) in mais_recente.items():
+        base[lote] = locais
+        dias = (hoje.date() - data.date()).days
+        quando = "hoje" if dias <= 0 else ("há 1 dia" if dias == 1 else f"há {dias} dias")
+        lidos[lote] = (f"{data.strftime('%d/%m')} · {quando}", dias)
+    return base, lidos
+
+
+@st.cache_data(ttl=10 * 60, show_spinner=False)
+def carregar_base_localizacao():
+    """Lê a Base de Localização inteira (1 chamada). Fica guardada por 10 minutos."""
+    valores = _cliente_google().open_by_key(ID_PLANILHA_SISTEMA).worksheet(ABA_BASE_LOC).get_all_values()
+    return valores
 
 # =====================================================================================
 # ORDEM DE CARREGAMENTO: FUNÇÕES
@@ -760,7 +853,7 @@ def carimbar_ordem(arquivo, itens, base):
     return saida
 
 
-def gerar_roteiro(cab, itens, base, data_base):
+def gerar_roteiro(cab, itens, base, origem_txt, lidos=None):
     """Folha 'Roteiro de Separação': itens agrupados por localização, sem localização no final."""
     from pypdf import PdfReader
     from collections import defaultdict
@@ -782,7 +875,9 @@ def gerar_roteiro(cab, itens, base, data_base):
         f"Pré-carga {cab.get('precarga', '')}", estilos["Title"]))
     elementos.append(Paragraph(
         f"{len(itens)} itens · {n_ok} localizados · {len(itens) - n_ok} sem localização "
-        f"&nbsp;&nbsp;|&nbsp;&nbsp; <i>Localizações conforme inventário de {data_base}</i>", estilos["Normal"]))
+        f"&nbsp;&nbsp;|&nbsp;&nbsp; <i>Localizações conforme {origem_txt}</i>"
+        + (f" &nbsp;|&nbsp; <font backColor='#FFF6CC'>&nbsp;amarelo&nbsp;</font> = lido há mais de "
+           f"{DIAS_LEITURA_ANTIGA} dias" if lidos is not None else ""), estilos["Normal"]))
     elementos.append(Spacer(1, 6))
 
     SEM = "~SEM"  # chave que fica por último na ordenação
@@ -791,7 +886,12 @@ def gerar_roteiro(cab, itens, base, data_base):
         locais = buscar_local(base, it["lote"])
         grupos[locais[0] if locais else SEM].append((it, locais))
 
-    dados = [["Localização", "Seq.", "Lote", "Descrição", "Qtd (t)", "Cliente", "OK"]]
+    if lidos is not None:
+        dados = [["Localização", "Seq.", "Lote", "Descrição", "Qtd (t)", "Cliente", "Lido em", "OK"]]
+        larguras = [38, 12, 26, 74, 16, 50, 36, 12]
+    else:
+        dados = [["Localização", "Seq.", "Lote", "Descrição", "Qtd (t)", "Cliente", "OK"]]
+        larguras = [38, 14, 30, 80, 18, 60, 12]
     estilo = [
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f2937")),
         ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
@@ -808,15 +908,21 @@ def gerar_roteiro(cab, itens, base, data_base):
             desc = it["desc"]
             if len(locais) > 1:
                 desc += f"  (também em {' / '.join(locais[1:])})"
-            dados.append([rotulo, it["seq"], it["lote"], desc, it["qtd"], it["cliente"], ""])
+            if lidos is not None:
+                txt, dias = lidos.get(it["lote"], ("", 0)) if locais else ("", 0)
+                dados.append([rotulo, it["seq"], it["lote"], desc, it["qtd"], it["cliente"], txt, ""])
+                if dias > DIAS_LEITURA_ANTIGA:
+                    estilo.append(("BACKGROUND", (6, linha), (6, linha), colors.HexColor("#FFF6CC")))
+                    estilo.append(("FONTNAME", (6, linha), (6, linha), "Helvetica-Bold"))
+            else:
+                dados.append([rotulo, it["seq"], it["lote"], desc, it["qtd"], it["cliente"], ""])
             linha += 1
         if chave == SEM:
             estilo.append(("BACKGROUND", (0, inicio), (-1, linha - 1), colors.HexColor("#FFE8CC")))
         estilo.append(("LINEBELOW", (0, linha - 1), (-1, linha - 1), 1.2, colors.black))
         estilo.append(("FONTNAME", (0, inicio), (0, linha - 1), "Helvetica-Bold"))
 
-    tabela = Table(dados, colWidths=[38 * mm, 14 * mm, 30 * mm, 80 * mm, 18 * mm, 60 * mm, 12 * mm],
-                   repeatRows=1)
+    tabela = Table(dados, colWidths=[l * mm for l in larguras], repeatRows=1)
     tabela.setStyle(TableStyle(estilo))
     elementos.append(tabela)
     doc.build(elementos)
@@ -970,6 +1076,10 @@ with aba_mao:
                  "da mesma filial das etiquetas, todos os armazéns. Mostra o que está no sistema e não "
                  "foi lido (Falta) e o que foi lido e não está no sistema (Sobra).")
         st.caption("Deixe desmarcado quando for só uma releitura de área para atualizar localização.")
+        atualizar_base = st.checkbox(
+            "📍 Atualizar Base de Localização", value=False, key="atualizar_base",
+            help="Grava a localização dos itens lidos na Base de Localização online. É ela que a aba "
+                 "Ordem de Carregamento consulta. Itens sem localização e leituras com erro não são gravados.")
         if arquivos_mao:
             col_msg_m, col_btn_m = st.columns([3, 1])
             with col_msg_m:
@@ -985,7 +1095,7 @@ with aba_mao:
             help='Se ficar em branco, o arquivo será salvo como "Inventario_LeitorMao.xlsx".'
         )
         data_inventario = st.date_input(
-            "Data do inventário:", value=datetime.now().date(), format="DD/MM/YYYY", key="data_inv",
+            "Data do inventário:", value=agora_br().date(), format="DD/MM/YYYY", key="data_inv",
             help="Dia em que as leituras foram feitas. Fica gravada no Excel e aparece no Roteiro de "
                  "Separação da aba Ordem de Carregamento."
         )
@@ -1039,6 +1149,18 @@ with aba_mao:
                                 aviso_estoque = ("Não consegui ler o estoque do Protheus agora. "
                                                  "A conversão foi feita sem a comparação.")
 
+                        # Base de Localização (opcional)
+                        msg_base, aviso_base = "", ""
+                        if atualizar_base:
+                            try:
+                                origem = ", ".join(a.name for a in arquivos_mao)[:100]
+                                n = gravar_base_localizacao(linhas_para_base(df_mao, origem))
+                                msg_base = (f"📍 {n} leitura(s) gravada(s) na Base de Localização."
+                                            if n else "📍 Nenhum item com localização para gravar na base.")
+                            except Exception:
+                                aviso_base = ("Não consegui gravar na Base de Localização agora. "
+                                              "Tente converter de novo daqui a pouco.")
+
                         nome = nome_arquivo_mao.strip() or "Inventario_LeitorMao"
                         st.session_state.resultado_mao = {
                             "df": df_mao,
@@ -1052,6 +1174,8 @@ with aba_mao:
                             "comparacao": comparacao,
                             "aviso_estoque": aviso_estoque,
                             "hora_estoque": hora_estoque,
+                            "msg_base": msg_base,
+                            "aviso_base": aviso_base,
                         }
                     else:
                         st.session_state.pop("resultado_mao", None)
@@ -1065,6 +1189,10 @@ with aba_mao:
         st.success(f"✅ Conversão concluída! {res['qtd_arquivos']} arquivo(s) processado(s).")
         if res.get("aviso_desc"):
             st.warning(f"⚠️ {res['aviso_desc']}")
+        if res.get("msg_base"):
+            st.info(res["msg_base"])
+        if res.get("aviso_base"):
+            st.warning(f"⚠️ {res['aviso_base']}")
 
         st.subheader("📊 Resumo da conversão")
         m1, m2, m3, m4, m5 = st.columns(5)
@@ -1228,14 +1356,21 @@ with aba_ordem:
     with st.expander("ℹ️ Como usar a Ordem de Carregamento", expanded=False):
         st.markdown(
             "1. Anexe um ou mais PDFs de **Pick-list de Carregamento** gerados no Protheus.\n"
-            "2. Anexe o **Excel do inventário** (convertido na aba Leitor de Mão ou App Celular). "
-            "Pode anexar mais de um, se o inventário foi feito em partes.\n"
+            "2. Escolha de onde vêm as localizações: da **Base de Localização online** (padrão, alimentada "
+            "pela aba Leitor de Mão) ou de um **Excel do inventário** anexado.\n"
             "3. Clique em **Preencher Ordens** e baixe o PDF.\n\n"
             "📄 O PDF final traz, para cada carga: a **ordem original com a localização preenchida** "
             "na coluna *Localizac* e logo depois o **Roteiro de Separação**, com os itens agrupados por local.\n\n"
             "✏️ Lotes que não estão no inventário ficam com a localização **em branco**, para o "
             "conferente preencher à mão. No roteiro eles aparecem no final, em laranja."
         )
+
+    origem_loc = st.radio(
+        "Origem das localizações:", ["🌐 Base de Localização (online)", "📎 Anexar Excel do inventário"],
+        horizontal=True, key="origem_loc",
+        help="Base online: usa a leitura mais recente de cada lote gravada pela aba Leitor de Mão "
+             "(caixinha 'Atualizar Base de Localização'). Excel: usa só o arquivo que você anexar.")
+    usar_online = origem_loc.startswith("🌐")
 
     col1_o, col2_o = st.columns([1, 1])
     with col1_o:
@@ -1245,24 +1380,31 @@ with aba_ordem:
             help="PDFs 'Pick-list de Carregamento' do Protheus. Pode anexar várias ordens de uma vez."
         )
     with col2_o:
-        bases_inv = st.file_uploader(
-            "2️⃣ Base do inventário (.xlsx)", type="xlsx", accept_multiple_files=True,
-            key=f"base_{st.session_state.uploader_key_ordem}",
-            help="Excel convertido nas abas Leitor de Mão ou App Celular (aba 'Inventario Geral'). "
-                 "Use sempre o inventário mais recente."
-        )
+        if usar_online:
+            bases_inv = []
+            st.info("🌐 As localizações virão da **Base de Localização online**. No roteiro, a coluna "
+                    "**Lido em** mostra há quantos dias cada lote foi lido.")
+        else:
+            bases_inv = st.file_uploader(
+                "2️⃣ Base do inventário (.xlsx)", type="xlsx", accept_multiple_files=True,
+                key=f"base_{st.session_state.uploader_key_ordem}",
+                help="Excel convertido nas abas Leitor de Mão ou App Celular (aba 'Inventario Geral'). "
+                     "Use sempre o inventário mais recente."
+            )
 
     col_nome_o, col_data_o = st.columns([1, 1])
     with col_nome_o:
         nome_pdf_ordem = st.text_input(
             "Nome do PDF final (sem .pdf):", value="", key="nome_ordem",
             help='Se ficar em branco, será salvo como "Ordens_Preenchidas.pdf".')
+    data_manual = ""
     with col_data_o:
-        data_manual = st.text_input(
-            "Data do inventário (só se não for preenchida sozinha):", value="", key="data_manual",
-            placeholder="DD/MM/AAAA",
-            help="Excel gerado pela aba Leitor de Mão já traz a data gravada. Para arquivos antigos "
-                 "ou do App Celular, digite aqui a data em que o inventário foi feito.")
+        if not usar_online:
+            data_manual = st.text_input(
+                "Data do inventário (só se não for preenchida sozinha):", value="", key="data_manual",
+                placeholder="DD/MM/AAAA",
+                help="Excel gerado pela aba Leitor de Mão já traz a data gravada. Para arquivos antigos "
+                     "ou do App Celular, digite aqui a data em que o inventário foi feito.")
 
     if ordens_pdf or bases_inv:
         col_msg_o, col_btn_o = st.columns([3, 1])
@@ -1276,24 +1418,30 @@ with aba_ordem:
     if st.button("Preencher Ordens", type="primary", key="preencher_ordem"):
         if not ordens_pdf:
             st.warning("⚠️ Anexe pelo menos uma Ordem de Carregamento (.pdf).")
-        elif not bases_inv:
+        elif not usar_online and not bases_inv:
             st.warning("⚠️ Anexe o Excel do inventário para buscar as localizações.")
         else:
             with st.spinner("Lendo ordens e buscando localizações..."):
                 try:
                     from pypdf import PdfWriter
-                    base, datas = ler_base_inventario(bases_inv)
-
-                    # Data que vai no roteiro
-                    datas = sorted(set(d for d in datas if d))
-                    if data_manual.strip():
-                        data_base = data_manual.strip()
-                    elif len(datas) == 1:
-                        data_base = datas[0]
-                    elif len(datas) > 1:
-                        data_base = " / ".join(datas)
+                    if usar_online:
+                        base, lidos = montar_base(carregar_base_localizacao())
+                        origem_txt = ("Base de Localização (consultada em "
+                                      f"{agora_br().strftime('%d/%m/%Y %H:%M')})")
                     else:
-                        data_base = "data não informada"
+                        base, datas = ler_base_inventario(bases_inv)
+                        lidos = None
+                        # Data que vai no roteiro
+                        datas = sorted(set(d for d in datas if d))
+                        if data_manual.strip():
+                            data_base = data_manual.strip()
+                        elif len(datas) == 1:
+                            data_base = datas[0]
+                        elif len(datas) > 1:
+                            data_base = " / ".join(datas)
+                        else:
+                            data_base = "data não informada"
+                        origem_txt = f"inventário de {data_base}"
 
                     pdf_final = PdfWriter()
                     resumo = []
@@ -1306,7 +1454,7 @@ with aba_ordem:
                             continue
                         for pagina in carimbar_ordem(io.BytesIO(pdf_bytes), itens, base).pages:
                             pdf_final.add_page(pagina)
-                        for pagina in gerar_roteiro(cab, itens, base, data_base).pages:
+                        for pagina in gerar_roteiro(cab, itens, base, origem_txt, lidos).pages:
                             pdf_final.add_page(pagina)
 
                         n_ok = sum(1 for it in itens if buscar_local(base, it["lote"]))
@@ -1324,7 +1472,7 @@ with aba_ordem:
                             "pdf": buf_pdf.getvalue(),
                             "nome": f"{nome_pdf_ordem.strip() or 'Ordens_Preenchidas'}.pdf",
                             "resumo": pd.DataFrame(resumo),
-                            "data_base": data_base,
+                            "origem_txt": origem_txt,
                             "lotes_base": len(base),
                         }
                     else:
@@ -1337,7 +1485,7 @@ with aba_ordem:
     if res_o:
         df_res = res_o["resumo"]
         st.success(f"✅ {len(df_res)} ordem(ns) preenchida(s). Base com {res_o['lotes_base']} lotes "
-                   f"(inventário de {res_o['data_base']}).")
+                   f"({res_o['origem_txt']}).")
 
         st.subheader("📊 Resumo")
         r1, r2, r3, r4 = st.columns(4)
