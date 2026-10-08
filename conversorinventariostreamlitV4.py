@@ -699,7 +699,7 @@ def montar_base(valores, hoje=None):
         base[lote] = locais
         dias = (hoje.date() - data.date()).days
         quando = "hoje" if dias <= 0 else ("há 1 dia" if dias == 1 else f"há {dias} dias")
-        lidos[lote] = (f"{data.strftime('%d/%m')} · {quando}", dias)
+        lidos[lote] = (f"{data.strftime('%d/%m')} - {quando}", dias)
     return base, lidos
 
 
@@ -871,13 +871,11 @@ def gerar_roteiro(cab, itens, base, origem_txt, lidos=None):
 
     n_ok = sum(1 for it in itens if buscar_local(base, it["lote"]))
     elementos.append(Paragraph(
-        f"<b>ROTEIRO DE SEPARAÇÃO</b> &nbsp;&nbsp; Carga {cab.get('carga', '')} &nbsp;·&nbsp; "
+        f"<b>ROTEIRO DE SEPARAÇÃO</b> &nbsp;&nbsp; Carga {cab.get('carga', '')} &nbsp;-&nbsp; "
         f"Pré-carga {cab.get('precarga', '')}", estilos["Title"]))
     elementos.append(Paragraph(
-        f"{len(itens)} itens · {n_ok} localizados · {len(itens) - n_ok} sem localização "
-        f"&nbsp;&nbsp;|&nbsp;&nbsp; <i>Localizações conforme {origem_txt}</i>"
-        + (f" &nbsp;|&nbsp; <font backColor='#FFF6CC'>&nbsp;amarelo&nbsp;</font> = lido há mais de "
-           f"{DIAS_LEITURA_ANTIGA} dias" if lidos is not None else ""), estilos["Normal"]))
+        f"{len(itens)} itens - {n_ok} localizados - {len(itens) - n_ok} sem localização "
+        f"&nbsp;&nbsp;|&nbsp;&nbsp; <i>Localizações conforme {origem_txt}</i>", estilos["Normal"]))
     elementos.append(Spacer(1, 6))
 
     SEM = "~SEM"  # chave que fica por último na ordenação
