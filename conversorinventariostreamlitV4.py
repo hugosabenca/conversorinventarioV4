@@ -710,6 +710,73 @@ def carregar_base_localizacao():
     return valores
 
 # =====================================================================================
+# LOCALIZAR LOTE: FUNÇÕES
+# =====================================================================================
+def buscar_lote(termo, valores_base, estoque):
+    """
+    Procura o lote na Base de Localização e no estoque do Protheus.
+      - 11 dígitos (ou lote não numérico, ex: MIX 03): busca exata
+      - 8 a 10 dígitos: todos os lotes que COMEÇAM com esses dígitos
+    Devolve uma lista de dicionários, um por lote encontrado.
+    """
+    termo = termo.strip().upper()
+    exato = not (termo.isdigit() and 8 <= len(termo) < 11)
+    confere = (lambda l: l.upper() == termo) if exato else (lambda l: l.startswith(termo))
+
+    # 1) Base de Localização: leitura mais recente de cada lote
+    leituras = {}
+    for linha in valores_base[1:]:
+        if len(linha) < 6 or not confere(linha[3].strip()):
+            continue
+        try:
+            data = datetime.strptime(linha[0].strip(), "%d/%m/%Y %H:%M:%S")
+        except ValueError:
+            continue
+        lote = linha[3].strip()
+        atual = leituras.get(lote)
+        if atual is None or data > atual["data"]:
+            leituras[lote] = {"data": data, "locais": [linha[5].strip()], "filial": linha[1].strip(),
+                              "armazem": linha[2].strip(), "codigo": linha[4].strip(),
+                              "origem": linha[6].strip() if len(linha) > 6 else ""}
+        elif data == atual["data"] and linha[5].strip() not in atual["locais"]:
+            atual["locais"].append(linha[5].strip())
+
+    # 2) Estoque do Protheus: saldo por lote
+    saldos = {}
+    if estoque is not None and not estoque.empty and "LOTE" in estoque.columns:
+        est = estoque.copy()
+        for col in ("LOTE", "ARMAZEM", "COD", "PRODUTO", "QTDE", "FILIAL"):
+            est[col] = est[col].astype(str).str.strip() if col in est.columns else ""
+        est = est[est["LOTE"].map(confere)].drop_duplicates(subset=["LOTE", "ARMAZEM", "FILIAL"])
+        est["QTDE"] = pd.to_numeric(est["QTDE"].str.replace(",", "."), errors="coerce").fillna(0)
+        for lote, grupo in est.groupby("LOTE"):
+            saldos[lote] = {"saldo": float(grupo["QTDE"].sum()),
+                            "armazens": ", ".join(sorted(set(grupo["ARMAZEM"]))),
+                            "codigo": grupo["COD"].iloc[0], "produto": grupo["PRODUTO"].iloc[0],
+                            "filial": grupo["FILIAL"].iloc[0][:2]}
+
+    # 3) Junta as duas fontes
+    resultado = []
+    hoje = agora_br().date()
+    for lote in sorted(set(leituras) | set(saldos)):
+        l, s = leituras.get(lote), saldos.get(lote)
+        dias = (hoje - l["data"].date()).days if l else None
+        resultado.append({
+            "lote": lote,
+            "locais": l["locais"] if l else [],
+            "data": l["data"] if l else None,
+            "dias": dias,
+            "filial": (l or {}).get("filial") or (s or {}).get("filial", ""),
+            "armazem": (l or {}).get("armazem") or (s or {}).get("armazens", ""),
+            "codigo": (l or {}).get("codigo") or (s or {}).get("codigo", ""),
+            "produto": (s or {}).get("produto", ""),
+            "origem": (l or {}).get("origem", ""),
+            "saldo": s["saldo"] if s else None,
+            "armazens_saldo": s["armazens"] if s else "",
+        })
+    return resultado, exato
+
+# =====================================================================================
 # ORDEM DE CARREGAMENTO: FUNÇÕES
 # =====================================================================================
 def ler_base_inventario(arquivos):
@@ -936,8 +1003,9 @@ st.set_page_config(page_title="Conversor de Inventário Dox", layout="wide")
 st.title("Conversor de Inventário Unificado")
 st.markdown("---")
 
-aba_celular, aba_mao, aba_etiquetas, aba_ordem = st.tabs(
-    ["📱 App Celular", "🔫 Leitor de Mão", "🏷️ Etiquetas de Localização", "🚚 Ordem de Carregamento"])
+aba_celular, aba_mao, aba_etiquetas, aba_ordem, aba_localizar = st.tabs(
+    ["📱 App Celular", "🔫 Leitor de Mão", "🏷️ Etiquetas de Localização", "🚚 Ordem de Carregamento",
+     "🔎 Localizar"])
 
 # =====================================================================================
 # ABA 1: APP CELULAR (sem alterações)
@@ -1502,4 +1570,108 @@ with aba_ordem:
                    "preenchida seguida do Roteiro de Separação.")
 
         st.download_button("📥 Baixar PDF das Ordens", data=res_o["pdf"], file_name=res_o["nome"],
-                           mime="application/pdf", key="baixar_ordem")                               
+                           mime="application/pdf", key="baixar_ordem")   
+
+# =====================================================================================
+# ABA 5: LOCALIZAR LOTE
+# =====================================================================================
+with aba_localizar:
+    st.info("Digite o **lote completo** (ex: `07700401003`) para ver onde ele está, ou só os "
+            "**8 primeiros dígitos** (ex: `07700401`) para ver todos os lotes que começam com eles.")
+    termo_busca = st.text_input(
+        "Lote", value="", key="termo_lote", placeholder="07700401003",
+        help="Lote completo: mostra a localização, quando foi lido e o saldo no Protheus. "
+             "8 primeiros dígitos: lista todos os lotes daquela família. Aperte Enter para buscar.")
+
+    termo_limpo = termo_busca.strip()
+    if termo_limpo:
+        if termo_limpo.isdigit() and len(termo_limpo) < 8:
+            st.warning("⚠️ Digite o lote completo ou pelo menos os **8 primeiros dígitos**.")
+        else:
+            with st.spinner("Procurando..."):
+                try:
+                    valores_base = carregar_base_localizacao()
+                except Exception:
+                    valores_base = [[]]
+                    st.warning("⚠️ Não consegui ler a Base de Localização agora. Mostrando só o estoque.")
+                try:
+                    estoque_loc, hora_est = carregar_estoque()
+                except Exception:
+                    estoque_loc, hora_est = None, ""
+                    st.warning("⚠️ Não consegui ler o estoque do Protheus agora. Mostrando só a localização.")
+                try:
+                    produtos_loc = carregar_produtos()
+                except Exception:
+                    produtos_loc = {}
+                achados, exato = buscar_lote(termo_limpo, valores_base, estoque_loc)
+
+            def _descricao(r):
+                return produtos_loc.get(r["codigo"], "") or r["produto"]
+
+            def _saldo_txt(r):
+                if r["saldo"] is None:
+                    return "Sem saldo no Protheus"
+                return f"{formatar_ton(r['saldo'])} t (armazém {r['armazens_saldo']})"
+
+            if not achados:
+                st.error(f"❌ Nenhum lote encontrado para **{termo_limpo}**, nem na Base de Localização "
+                         "nem no estoque do Protheus. Confira se digitou certo.")
+
+            elif exato and len(achados) == 1:
+                r = achados[0]
+                if r["locais"]:
+                    local_txt = " / ".join(r["locais"])
+                    st.markdown(
+                        f"<div style='font-size:13px;color:#808495;margin-top:8px'>📍 LOCALIZAÇÃO</div>"
+                        f"<div style='font-size:48px;font-weight:800;line-height:1.1'>{local_txt}</div>",
+                        unsafe_allow_html=True)
+                    quando = "hoje" if r["dias"] <= 0 else ("há 1 dia" if r["dias"] == 1 else f"há {r['dias']} dias")
+                    data_txt = r["data"].strftime("%d/%m/%Y às %H:%M")
+                    if r["dias"] > DIAS_LEITURA_ANTIGA:
+                        st.warning(f"⚠️ Lido em **{data_txt}** ({quando}). A localização pode estar "
+                                   "desatualizada, confira no local.")
+                    else:
+                        st.success(f"✅ Lido em **{data_txt}** ({quando}).")
+                    if len(r["locais"]) > 1:
+                        st.caption("Este lote foi lido em mais de um local na mesma leitura.")
+                else:
+                    st.warning(f"🔍 O lote **{r['lote']}** não está na Base de Localização. "
+                               + (f"**Saldo no Protheus: {_saldo_txt(r)}**, ou seja, o material existe "
+                                  "mas ainda não foi lido em nenhum local." if r["saldo"] is not None else ""))
+
+                campos = [
+                    ("Lote", r["lote"]), ("Código", r["codigo"] or "—"),
+                    ("Descrição", _descricao(r) or "—"),
+                    ("Filial / Armazém", f"{r['filial'] or '—'} / {r['armazem'] or '—'}"),
+                    ("Saldo no Protheus", _saldo_txt(r)), ("Leitura de origem", r["origem"] or "—"),
+                ]
+                celulas = "".join(
+                    f"<div><div style='font-size:13px;color:#808495'>{rot}</div>"
+                    f"<div style='font-size:16px;font-weight:600'>{val}</div></div>" for rot, val in campos)
+                st.markdown(f"<div style='display:grid;grid-template-columns:1fr 1fr 2fr;gap:14px 24px;"
+                            f"margin:12px 0'>{celulas}</div>", unsafe_allow_html=True)
+                if hora_est:
+                    st.caption(f"Estoque do Protheus copiado pelo robô em {hora_est}.")
+
+            else:
+                st.success(f"🔎 {len(achados)} lote(s) encontrado(s) para **{termo_limpo}**.")
+                tabela = pd.DataFrame([{
+                    "Lote": r["lote"],
+                    "Localização": " / ".join(r["locais"]) or "NÃO LIDO",
+                    "Lido em": (r["data"].strftime("%d/%m/%Y") if r["data"] else ""),
+                    "Dias": "" if r["dias"] is None else str(r["dias"]),
+                    "Descrição": _descricao(r),
+                    "Saldo Protheus (t)": "Sem saldo" if r["saldo"] is None else formatar_ton(r["saldo"]),
+                } for r in achados])
+                cores = ["#FFE8CC" if not r["locais"] else
+                         ("#FFF6CC" if r["dias"] is not None and r["dias"] > DIAS_LEITURA_ANTIGA else "")
+                         for r in achados]
+                st.dataframe(
+                    tabela.style.apply(lambda row: [f"background-color: {cores[row.name]}" if cores[row.name]
+                                                    else ""] * len(row), axis=1),
+                    hide_index=True, use_container_width=True)
+                st.caption(f"🟧 Não lido em nenhum local (só existe no estoque do Protheus) · "
+                           f"🟨 Lido há mais de {DIAS_LEITURA_ANTIGA} dias. Para ver os detalhes de um lote, "
+                           "digite o número completo.")
+                if hora_est:
+                    st.caption(f"Estoque do Protheus copiado pelo robô em {hora_est}.")                                    
