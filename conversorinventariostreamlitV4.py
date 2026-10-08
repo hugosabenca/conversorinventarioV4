@@ -714,14 +714,22 @@ def carregar_base_localizacao():
 # =====================================================================================
 def buscar_lote(termo, valores_base, estoque):
     """
-    Procura o lote na Base de Localização e no estoque do Protheus.
-      - 11 dígitos (ou lote não numérico, ex: MIX 03): busca exata
-      - 8 a 10 dígitos: todos os lotes que COMEÇAM com esses dígitos
-    Devolve uma lista de dicionários, um por lote encontrado.
+    Procura o lote digitado na Base de Localização e no estoque do Protheus.
+      1º) tenta achar o lote EXATO (qualquer tamanho, ex: 07700401003, MIX 03, 1234)
+      2º) se não achar, lista todos os lotes que COMEÇAM com o que foi digitado
+    Devolve (lista de lotes encontrados, True se achou o lote exato).
     """
     termo = termo.strip().upper()
-    exato = not (termo.isdigit() and 8 <= len(termo) < 11)
-    confere = (lambda l: l.upper() == termo) if exato else (lambda l: l.startswith(termo))
+    if not termo:
+        return [], True
+    achados = _buscar_lote_com(lambda l: l.upper() == termo, valores_base, estoque)
+    if achados:
+        return achados, True
+    return _buscar_lote_com(lambda l: l.upper().startswith(termo), valores_base, estoque), False
+
+
+def _buscar_lote_com(confere, valores_base, estoque):
+    """Procura na base e no estoque os lotes que passam no teste 'confere'."""
 
     # 1) Base de Localização: leitura mais recente de cada lote
     leituras = {}
@@ -774,7 +782,7 @@ def buscar_lote(termo, valores_base, estoque):
             "saldo": s["saldo"] if s else None,
             "armazens_saldo": s["armazens"] if s else "",
         })
-    return resultado, exato
+    return resultado
 
 # =====================================================================================
 # ORDEM DE CARREGAMENTO: FUNÇÕES
@@ -1576,17 +1584,18 @@ with aba_ordem:
 # ABA 5: LOCALIZAR LOTE
 # =====================================================================================
 with aba_localizar:
-    st.info("Digite o **lote completo** (ex: `07700401003`) para ver onde ele está, ou só os "
-            "**8 primeiros dígitos** (ex: `07700401`) para ver todos os lotes que começam com eles.")
+    st.info("Digite o **lote** (ex: `07700401003` ou `MIX 03`) para ver onde ele está. Se o lote exato "
+            "não existir, o sistema mostra todos os lotes que **começam** com o que foi digitado "
+            "(ex: `07700401` lista toda a família).")
     termo_busca = st.text_input(
         "Lote", value="", key="termo_lote", placeholder="07700401003",
-        help="Lote completo: mostra a localização, quando foi lido e o saldo no Protheus. "
-             "8 primeiros dígitos: lista todos os lotes daquela família. Aperte Enter para buscar.")
+        help="Lote encontrado: mostra a localização, quando foi lido e o saldo no Protheus. "
+             "Lote não encontrado: lista os lotes que começam com o que foi digitado. Aperte Enter para buscar.")
 
     termo_limpo = termo_busca.strip()
     if termo_limpo:
-        if termo_limpo.isdigit() and len(termo_limpo) < 8:
-            st.warning("⚠️ Digite o lote completo ou pelo menos os **8 primeiros dígitos**.")
+        if len(termo_limpo) < 3:
+            st.warning("⚠️ Digite pelo menos **3 caracteres** do lote.")
         else:
             with st.spinner("Procurando..."):
                 try:
@@ -1654,7 +1663,12 @@ with aba_localizar:
                     st.caption(f"Estoque do Protheus copiado pelo robô em {hora_est}.")
 
             else:
-                st.success(f"🔎 {len(achados)} lote(s) encontrado(s) para **{termo_limpo}**.")
+                st.warning(f"🔎 Lote **{termo_limpo}** não encontrado, porém foram encontrados os "
+                           f"**{len(achados)} lote(s)** abaixo que iniciam com a mesma sequência:")
+                LIMITE_LISTA = 200
+                if len(achados) > LIMITE_LISTA:
+                    st.caption(f"Mostrando os {LIMITE_LISTA} primeiros. Digite mais caracteres para filtrar.")
+                    achados = achados[:LIMITE_LISTA]
                 tabela = pd.DataFrame([{
                     "Lote": r["lote"],
                     "Localização": " / ".join(r["locais"]) or "NÃO LIDO",
