@@ -1157,9 +1157,9 @@ with aba_mao:
                                 n = gravar_base_localizacao(linhas_para_base(df_mao, origem))
                                 msg_base = (f"📍 {n} leitura(s) gravada(s) na Base de Localização."
                                             if n else "📍 Nenhum item com localização para gravar na base.")
-                            except Exception:
+                            except Exception as e:
                                 aviso_base = ("Não consegui gravar na Base de Localização agora. "
-                                              "Tente converter de novo daqui a pouco.")
+                                              f"Detalhe: {type(e).__name__}: {str(e)[:300]}")
 
                         nome = nome_arquivo_mao.strip() or "Inventario_LeitorMao"
                         st.session_state.resultado_mao = {
