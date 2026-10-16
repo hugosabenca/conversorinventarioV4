@@ -242,7 +242,7 @@ def interpretar_leitura_mao(texto):
       - {"tipo": "erro", "motivo": "..."}
     Padrão do item: FILIAL-PRODUTO -ARMAZÉM-LOTE-PESO
     """
-    texto = str(texto).strip()
+    texto = str(texto).strip().upper()   # tudo em maiúsculo (o leitor às vezes manda minúsculo, ex: Caps Lock)
 
     # É uma localização? (QR com prefixo LOC:)
     if texto.upper().startswith(PREFIXO_LOC):
