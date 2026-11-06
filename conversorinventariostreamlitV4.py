@@ -7,6 +7,7 @@ from datetime import datetime
 import json
 import tempfile
 import io
+import re
 
 # =====================================================================================
 # FUNÇÃO UNIFICADA: PROCESSA O ARQUIVO INDEPENDENTE DO TIPO
@@ -234,6 +235,59 @@ COR_DUPLICADO = "FFF6CC"   # amarelo
 COR_SEM_LOC = "FFE8CC"     # laranja
 COR_ERRO = "FFD9D9"        # vermelho
 
+def interpretar_etiqueta_fornecedor(texto):
+    """
+    Etiqueta que NÃO é da Dox (etiqueta do fornecedor, bobina ainda não reetiquetada).
+    Usa as mesmas regras da aba App Celular para achar o LOTE e o PESO:
+      1. Código de barras com asteriscos:  *X*12500*ABC123*   -> lote ABC123, peso 12,5 t
+      2. QR com dados entre chaves:        ABC123{"peso": 12.5} -> lote ABC123, peso 12,5 t
+      3. Hífens com vírgula no peso:       01-COD-02-ABC123-12,500 -> lote ABC123, peso 12,5 t
+      4. Só hífens (4 partes ou mais):     A-B-C-ABC123-12500 -> lote ABC123, peso 12,5 t
+      5. Só números, até 5 dígitos:        12500 -> é só o peso, sem lote (vira erro)
+      6. Qualquer outra coisa:             o texto inteiro é o lote, sem peso
+    Filial, código e armazém são preenchidos depois (unidade do topo + estoque do Protheus).
+    """
+    lote, peso = "", None
+    try:
+        if "*" in texto:
+            partes = texto.split("*")
+            if texto.startswith("*"):
+                lote, peso = partes[3].strip(), float(partes[2].strip()) / 1000.0
+            else:
+                lote, peso = partes[2].strip(), float(partes[1].strip()) / 1000.0
+        elif "{" in texto and "}" in texto:
+            lote = texto.split("{", 1)[0].strip('"- ')
+            achou = re.search(r'"?PESO"?\s*:\s*"?(\d+(?:[.,]\d+)?)', texto)
+            peso = float(achou.group(1).replace(",", ".")) if achou else None
+        elif "," in texto and "-" in texto:
+            partes_v = texto.split(",")
+            decimal = partes_v[-1].strip()
+            if len(partes_v) > 1 and decimal.replace(".", "", 1).isdigit():
+                hifens = ",".join(partes_v[:-1]).split("-")
+                lote = hifens[-2].strip()
+                peso = float(f"{hifens[-1].strip()}.{decimal}")
+            else:
+                hifens = texto.split("-")
+                lote, peso = hifens[3].strip(), float(hifens[-1].strip()) / 1000.0
+        elif len(texto.split("-")) >= 4:
+            hifens = texto.split("-")
+            lote = hifens[3].strip()
+            try:
+                peso = float(hifens[-1].strip()) / 1000.0
+            except ValueError:
+                peso = None
+        elif texto.isdigit() and len(texto) <= 5:
+            return {"tipo": "erro", "motivo": f'Só o peso, sem lote: "{texto}"'}
+        else:
+            lote = texto
+    except (IndexError, ValueError):
+        return {"tipo": "erro", "motivo": f'Etiqueta não reconhecida: "{texto}"'}
+
+    if not lote:
+        return {"tipo": "erro", "motivo": f'Etiqueta sem lote: "{texto}"'}
+    return {"tipo": "fornecedor", "Lote": lote, "Peso": peso}
+
+
 def interpretar_leitura_mao(texto):
     """
     Recebe o texto de UMA leitura e devolve um dicionário com o tipo:
@@ -251,9 +305,9 @@ def interpretar_leitura_mao(texto):
             return {"tipo": "local", "local": local}
         return {"tipo": "erro", "motivo": "QR de localização sem nome"}
 
-    # É um item? Precisa ter o " -" que separa o produto do armazém
-    if " -" not in texto:
-        return {"tipo": "erro", "motivo": f'Fora do padrão: "{texto}"'}
+    # Não tem cara de etiqueta Dox (começa com "05-" e tem o " -")? Tenta como etiqueta de fornecedor
+    if not (re.match(r"^\d{2}-", texto) and " -" in texto):
+        return interpretar_etiqueta_fornecedor(texto)
 
     lado_esq, lado_dir = texto.split(" -", 1)
     partes_esq = lado_esq.split("-", 1)
@@ -304,17 +358,93 @@ def processar_planilha_leitor(arquivo):
                 if r["tipo"] == "erro":
                     linhas.append({"Filial": "", "Código": "", "Armazém": "", "Lote": "",
                                    "Peso": None, "Localização": local_atual or "SEM LOCALIZAÇÃO",
-                                   "Observação": r["motivo"], "_status": "erro"})
+                                   "Observação": r["motivo"], "_status": "erro", "_fornecedor": False})
                     continue
 
-                linhas.append({"Filial": r["Filial"], "Código": r["Código"],
-                               "Armazém": r["Armazém"], "Lote": r["Lote"], "Peso": r["Peso"],
+                fornecedor = r["tipo"] == "fornecedor"
+                linhas.append({"Filial": "" if fornecedor else r["Filial"],
+                               "Código": "" if fornecedor else r["Código"],
+                               "Armazém": "" if fornecedor else r["Armazém"],
+                               "Lote": r["Lote"], "Peso": r["Peso"],
                                "Localização": local_atual or "SEM LOCALIZAÇÃO",
                                "Observação": "" if local_atual else "Lido antes de qualquer QR de localização",
-                               "_status": "ok" if local_atual else "semloc"})
+                               "_status": "ok" if local_atual else "semloc",
+                               "_fornecedor": fornecedor})
 
     return pd.DataFrame(linhas, columns=["Filial", "Código", "Armazém", "Lote", "Peso",
-                                         "Localização", "Observação", "_status"])
+                                         "Localização", "Observação", "_status", "_fornecedor"])
+
+
+def conferir_filial(df_mao, unidade):
+    """
+    Confere a filial das etiquetas Dox com a unidade escolhida no topo.
+      - Maioria das leituras de outra filial: a unidade escolhida deve estar errada -> bloqueia
+        (não grava na base nem compara com o estoque).
+      - Poucas leituras de outra filial (ex: bobina transferida com etiqueta antiga): só essas
+        viram erro (vermelho, não gravam); o resto segue normal.
+    Devolve (df, bloquear, n_outra, n_itens, filiais_outra).
+    """
+    df = df_mao.copy()
+    itens = df["_status"] != "erro"
+    filial_norm = df["Filial"].fillna("").astype(str).str.strip().str.zfill(2)
+    diferente = itens & (df["Filial"].fillna("") != "") & (filial_norm != unidade)
+    etiquetas_dox = itens & (df["Filial"].fillna("") != "")   # fornecedor não tem filial
+    n_outra, n_itens = int(diferente.sum()), int(etiquetas_dox.sum())
+    filiais_outra = sorted(set(filial_norm[diferente]))
+    bloquear = n_itens > 0 and n_outra > n_itens / 2
+    if n_outra and not bloquear:
+        aviso = df.loc[diferente, "Filial"].apply(
+            lambda f: f"Etiqueta da filial {f}, diferente da unidade selecionada ({unidade})")
+        df.loc[diferente, "Observação"] = [f"{a} | {o}" if o else a
+                                           for a, o in zip(aviso, df.loc[diferente, "Observação"])]
+        df.loc[diferente, "_status"] = "erro"
+    return df, bloquear, n_outra, n_itens, filiais_outra
+
+
+def completar_fornecedor(df_mao, unidade):
+    """
+    Etiquetas de fornecedor não trazem filial, código nem armazém:
+      - Filial  = unidade escolhida no topo
+      - Código e Armazém = buscados no estoque do Protheus (Dados_Estoque) pelo lote, na mesma unidade
+    Devolve (df, n_fornecedor, n_nao_encontrados, aviso).
+    """
+    df = df_mao.copy()
+    forn = df["_fornecedor"].fillna(False).astype(bool) & (df["_status"] != "erro")
+    n_forn = int(forn.sum())
+    if not n_forn:
+        return df, 0, 0, ""
+    df.loc[forn, "Filial"] = unidade
+
+    aviso, achados = "", None
+    try:
+        estoque, _ = carregar_estoque()
+        est = estoque.copy()
+        for col in ("FILIAL", "LOTE", "COD", "ARMAZEM"):
+            if col not in est.columns:
+                est[col] = ""
+            est[col] = est[col].astype(str).str.strip()
+        est = est[est["FILIAL"].str.startswith(f"{unidade}-") & (est["LOTE"] != "")]
+        achados = {}
+        for lote, grupo in est.groupby("LOTE", sort=False):
+            achados[lote.upper()] = (grupo["COD"].iloc[0], " / ".join(dict.fromkeys(grupo["ARMAZEM"])))
+    except Exception:
+        aviso = ("Não consegui consultar o estoque do Protheus agora: as etiquetas de fornecedor "
+                 "ficaram sem código e armazém.")
+
+    n_nao = 0
+    for i in df.index[forn]:
+        lote = df.at[i, "Lote"]
+        if achados is None:
+            obs = "Etiqueta de fornecedor - Protheus não consultado"
+        elif lote in achados:
+            df.at[i, "Código"], df.at[i, "Armazém"] = achados[lote]
+            obs = "Etiqueta de fornecedor"
+        else:
+            obs = "Etiqueta de fornecedor - lote não encontrado no Protheus"
+            n_nao += 1
+        anterior = df.at[i, "Observação"]
+        df.at[i, "Observação"] = f"{obs} | {anterior}" if anterior else obs
+    return df, n_forn, n_nao, aviso
 
 
 def marcar_duplicados(df):
@@ -572,15 +702,15 @@ def formatar_ton(v):
     return "" if pd.isna(v) else f"{v:.3f}".replace(".", ",")
 
 
-def comparar_com_estoque(df_mao, estoque):
+def comparar_com_estoque(df_mao, estoque, unidade):
     """
-    Cruza os lotes lidos com o estoque do Protheus da(s) mesma(s) filial(is) das etiquetas.
+    Cruza os lotes lidos com o estoque do Protheus da unidade escolhida no topo.
       - Falta: está no Protheus e não foi lido
       - Sobra: foi lido e não está no Protheus
     """
     itens = df_mao[df_mao["_status"] != "erro"]
-    filiais = sorted(set(f for f in itens["Filial"] if f))
-    prefixos = tuple(f"{f}-" for f in filiais)
+    filiais = [unidade]
+    prefixos = (f"{unidade}-",)   # no Dados_Estoque a filial vem como "05-PINHEIRAL"
 
     est = estoque.copy()
     for col in ("FILIAL", "LOTE", "COD", "PRODUTO", "ARMAZEM", "QTDE", "DIAS.ESTOQUE"):
@@ -670,9 +800,9 @@ def gravar_base_localizacao(linhas):
             raise
 
 
-def montar_base(valores, hoje=None):
+def montar_base(valores, hoje=None, filial=None):
     """
-    Recebe as linhas da aba (com cabeçalho) e devolve:
+    Recebe as linhas da aba (com cabeçalho) e devolve (só da filial pedida, se informada):
       - base:  {lote: [localizações da leitura MAIS RECENTE]}
       - lidos: {lote: ("06/10 · há 2 dias", dias)}
     """
@@ -684,6 +814,8 @@ def montar_base(valores, hoje=None):
         data_txt, lote, local = linha[0].strip(), linha[3].strip(), linha[5].strip()
         if not lote or not local:
             continue
+        if filial and linha[1].strip().zfill(2) != filial:
+            continue                          # leitura de outra unidade
         try:
             data = datetime.strptime(data_txt, "%d/%m/%Y %H:%M:%S")
         except ValueError:
@@ -712,7 +844,7 @@ def carregar_base_localizacao():
 # =====================================================================================
 # LOCALIZAR LOTE: FUNÇÕES
 # =====================================================================================
-def buscar_lote(termo, valores_base, estoque):
+def buscar_lote(termo, valores_base, estoque, filial=None):
     """
     Procura o lote digitado na Base de Localização e no estoque do Protheus.
       1º) tenta achar o lote EXATO (qualquer tamanho, ex: 07700401003, MIX 03, 1234)
@@ -722,20 +854,22 @@ def buscar_lote(termo, valores_base, estoque):
     termo = termo.strip().upper()
     if not termo:
         return [], True
-    achados = _buscar_lote_com(lambda l: l.upper() == termo, valores_base, estoque)
+    achados = _buscar_lote_com(lambda l: l.upper() == termo, valores_base, estoque, filial)
     if achados:
         return achados, True
-    return _buscar_lote_com(lambda l: l.upper().startswith(termo), valores_base, estoque), False
+    return _buscar_lote_com(lambda l: l.upper().startswith(termo), valores_base, estoque, filial), False
 
 
-def _buscar_lote_com(confere, valores_base, estoque):
-    """Procura na base e no estoque os lotes que passam no teste 'confere'."""
+def _buscar_lote_com(confere, valores_base, estoque, filial=None):
+    """Procura na base e no estoque os lotes que passam no teste 'confere' (só da filial, se informada)."""
 
     # 1) Base de Localização: leitura mais recente de cada lote
     leituras = {}
     for linha in valores_base[1:]:
         if len(linha) < 6 or not confere(linha[3].strip()):
             continue
+        if filial and linha[1].strip().zfill(2) != filial:
+            continue                          # leitura de outra unidade
         try:
             data = datetime.strptime(linha[0].strip(), "%d/%m/%Y %H:%M:%S")
         except ValueError:
@@ -756,6 +890,8 @@ def _buscar_lote_com(confere, valores_base, estoque):
         for col in ("LOTE", "ARMAZEM", "COD", "PRODUTO", "QTDE", "FILIAL"):
             est[col] = est[col].astype(str).str.strip() if col in est.columns else ""
         est = est[est["LOTE"].map(confere)].drop_duplicates(subset=["LOTE", "ARMAZEM", "FILIAL"])
+        if filial:
+            est = est[est["FILIAL"].str.startswith(f"{filial}-")]   # "05-PINHEIRAL"
         est["QTDE"] = pd.to_numeric(est["QTDE"].str.replace(",", "."), errors="coerce").fillna(0)
         for lote, grupo in est.groupby("LOTE"):
             saldos[lote] = {"saldo": float(grupo["QTDE"].sum()),
@@ -787,7 +923,7 @@ def _buscar_lote_com(confere, valores_base, estoque):
 # =====================================================================================
 # ORDEM DE CARREGAMENTO: FUNÇÕES
 # =====================================================================================
-def ler_base_inventario(arquivos):
+def ler_base_inventario(arquivos, filial=None):
     """
     Lê um ou mais Excel de inventário (gerados pelo Leitor de Mão ou pelo App Celular)
     e devolve:
@@ -802,9 +938,12 @@ def ler_base_inventario(arquivos):
         if df is None or "Lote" not in df.columns or "Localização" not in df.columns:
             raise ValueError(f'O arquivo "{arq.name}" não tem a aba "Inventario Geral" com as colunas Lote e Localização.')
 
-        for lote, local in zip(df["Lote"], df["Localização"]):
+        filiais = df["Filial"] if "Filial" in df.columns else [None] * len(df)
+        for lote, local, fil in zip(df["Lote"], df["Localização"], filiais):
             if pd.isna(lote) or pd.isna(local):
                 continue
+            if filial and not pd.isna(fil) and str(fil).strip() and str(fil).strip().zfill(2) != filial:
+                continue                      # item de outra unidade
             lote, local = str(lote).strip(), str(local).strip()
             if not lote or not local or local == "SEM LOCALIZAÇÃO":
                 continue
@@ -829,6 +968,19 @@ def buscar_local(base, lote):
     return []
 
 
+# Palavra que identifica cada unidade no cabeçalho do PDF ("Filial: DOX - FILIAL PINHEIRAL")
+PALAVRAS_UNIDADE = {"05": "PINHEIRAL", "02": "BICAS", "01": "FRANCISCO"}
+
+
+def unidade_da_ordem(filial_txt):
+    """Descobre de qual unidade é a ordem pelo texto do cabeçalho. Vazio se não reconhecer."""
+    texto = (filial_txt or "").upper()
+    for codigo, palavra in PALAVRAS_UNIDADE.items():
+        if palavra in texto:
+            return codigo
+    return ""
+
+
 def ler_ordem_carregamento(arquivo):
     """
     Lê o PDF 'Pick-list de Carregamento' do Protheus e devolve:
@@ -839,7 +991,7 @@ def ler_ordem_carregamento(arquivo):
     import pdfplumber
     from collections import defaultdict
 
-    itens, cab = [], {}
+    itens, cab, filial_txt = [], {}, ""
     with pdfplumber.open(arquivo) as pdf:
         for num_pag, pag in enumerate(pdf.pages):
             palavras = pag.extract_words()
@@ -855,6 +1007,10 @@ def ler_ordem_carregamento(arquivo):
             for i, topo in enumerate(topos):
                 lw = sorted(linhas[topo], key=lambda w: w["x0"])
                 textos = [w["text"] for w in lw]
+
+                # Cabeçalho: "... / Filial: DOX - FILIAL PINHEIRAL"
+                if not filial_txt and "Filial:" in textos:
+                    filial_txt = " ".join(textos[textos.index("Filial:") + 1:])
 
                 # Cabeçalho: a linha de baixo do "Pre-Car" tem os números
                 if any(t.startswith("Pre-Car") for t in textos) and i + 1 < len(topos):
@@ -881,6 +1037,7 @@ def ler_ordem_carregamento(arquivo):
                     "lote": lotes[0]["text"], "cliente": cliente,
                     "x0": x0_loc, "x1": x1_loc, "top": lw[0]["top"], "bottom": lw[0]["bottom"],
                 })
+    cab["filial_txt"] = filial_txt
     return cab, itens
 
 
@@ -1009,6 +1166,40 @@ def gerar_roteiro(cab, itens, base, origem_txt, lidos=None):
 
 st.set_page_config(page_title="Conversor de Inventário Dox", layout="wide")
 st.title("Conversor de Inventário Unificado")
+
+# ---------------- SELETOR DE UNIDADE (obrigatório nas abas que usam a base) ----------------
+UNIDADES = {
+    "01": "São Francisco do Sul",
+    "02": "São Joaquim de Bicas",
+    "05": "Pinheiral",
+}
+AVISO_SEM_UNIDADE = "⚠️ Escolha a **unidade** no topo da página para usar esta aba."
+MSG_ORDEM_OUTRA = ("🚫 Ordem(ns) de outra unidade, **não preenchida(s)**: {lista}. A unidade escolhida no "
+                   "topo é **{unidade}**. Se a unidade do topo estiver errada, corrija e clique em "
+                   "**Preencher Ordens** de novo.")
+
+def trocar_unidade():
+    # Ao trocar de unidade, apaga os resultados que estavam na tela (eram da unidade anterior)
+    for chave in ("resultado_mao", "resultado_ordem"):
+        st.session_state.pop(chave, None)
+
+col_uni, col_uni_msg = st.columns([1, 2])
+with col_uni:
+    unidade = st.selectbox(
+        "🏭 Unidade:", options=list(UNIDADES.keys()), index=None,
+        format_func=lambda c: f"{c} - {UNIDADES[c]}",
+        placeholder="— Selecione a unidade —", key="unidade", on_change=trocar_unidade,
+        help="Filial onde você está trabalhando. Obrigatória nas abas Leitor de Mão, Ordem de "
+             "Carregamento e Localizar: cada unidade só enxerga e grava as suas próprias localizações. "
+             "As abas App Celular e Etiquetas funcionam sem escolher.")
+with col_uni_msg:
+    st.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)  # alinha com a caixinha
+    if unidade:
+        st.success(f"🏭 Trabalhando na unidade **{unidade} - {UNIDADES[unidade]}**.")
+    else:
+        st.warning("⚠️ Escolha a unidade para usar as abas **Leitor de Mão**, "
+                   "**Ordem de Carregamento** e **Localizar**.")
+
 st.markdown("---")
 
 aba_celular, aba_mao, aba_etiquetas, aba_ordem, aba_localizar = st.tabs(
@@ -1115,6 +1306,8 @@ with aba_celular:
 # ABA 2: LEITOR DE MÃO
 # =====================================================================================
 with aba_mao:
+    if not unidade:
+        st.warning(AVISO_SEM_UNIDADE)
     if 'uploader_key_mao' not in st.session_state:
         st.session_state.uploader_key_mao = 0
 
@@ -1124,13 +1317,21 @@ with aba_mao:
 
     with st.expander("ℹ️ Como usar o Leitor de Mão", expanded=False):
         st.markdown(
-            "1. Abra uma planilha Excel em branco e clique na célula **A1**.\n"
-            "2. Ao chegar em cada local, **leia primeiro o QR da localização** (ex: `LOC:N4F1`) "
+            "1. Escolha a **unidade** no topo da página (a filial onde o inventário foi feito).\n"
+            "2. Abra uma planilha Excel em branco e clique na célula **A1**.\n"
+            "3. Ao chegar em cada local, **leia primeiro o QR da localização** (ex: `LOC:N4F1`) "
             "e depois todas as etiquetas daquele local.\n"
-            "3. Ao terminar, salve a planilha e anexe abaixo.\n\n"
+            "4. Ao terminar, salve a planilha e anexe abaixo.\n\n"
             "Formato esperado da etiqueta: `FILIAL-PRODUTO -ARMAZÉM-LOTE-PESO`\n\n"
+            "📦 **Etiqueta de fornecedor** (bobina ainda sem etiqueta Dox): o sistema tenta achar o lote "
+            "na etiqueta, usa a unidade do topo como filial e busca código e armazém no Protheus. "
+            "Na coluna Observação aparece *Etiqueta de fornecedor*: é a lista de bobinas para reetiquetar.\n\n"
+            "🏭 **Conferência da filial:** se a **maioria** das etiquetas for de outra filial, o sistema "
+            "entende que a unidade do topo está errada e **não grava nada** até você corrigir. Se forem "
+            "só **algumas** (ex: bobina transferida com etiqueta antiga), só essas ficam em vermelho e "
+            "não são gravadas.\n\n"
             "🎨 **Legenda das cores:** 🟨 lote lido mais de uma vez · "
-            "🟧 item sem localização · 🟥 leitura fora do padrão"
+            "🟧 item sem localização · 🟥 leitura com erro (fora do padrão ou de outra filial)"
         )
 
     col1_m, col2_m = st.columns([2, 1])
@@ -1147,7 +1348,7 @@ with aba_mao:
         comparar_estoque = st.checkbox(
             "🔍 Comparar com o estoque do Protheus", value=False, key="comparar_est",
             help="Cruza os lotes lidos com o estoque do Protheus (aba Dados_Estoque, atualizada pelo robô) "
-                 "da mesma filial das etiquetas, todos os armazéns. Mostra o que está no sistema e não "
+                 "da unidade escolhida no topo, todos os armazéns. Mostra o que está no sistema e não "
                  "foi lido (Falta) e o que foi lido e não está no sistema (Sobra).")
         st.caption("Deixe desmarcado quando for só uma releitura de área para atualizar localização.")
         atualizar_base = st.checkbox(
@@ -1175,7 +1376,7 @@ with aba_mao:
         )
 
     st.markdown("###")
-    if st.button("Converter Planilhas", type="primary", key="converter_mao"):
+    if st.button("Converter Planilhas", type="primary", key="converter_mao", disabled=not unidade):
         if not arquivos_mao:
             st.warning("⚠️ Por favor, carregue pelo menos uma planilha .xlsx.")
         else:
@@ -1193,7 +1394,25 @@ with aba_mao:
                             st.error(f"Erro ao ler o arquivo {arq.name}: {e}")
 
                     if dfs:
-                        df_mao = marcar_duplicados(pd.concat(dfs, ignore_index=True))
+                        df_mao, bloqueio_filial, n_outra, n_itens, filiais_outra = conferir_filial(
+                            pd.concat(dfs, ignore_index=True), unidade)
+                        df_mao, n_forn, n_forn_nao, aviso_forn = completar_fornecedor(df_mao, unidade)
+                        df_mao = marcar_duplicados(df_mao)
+                        msg_bloqueio, aviso_filial = "", ""
+                        if bloqueio_filial:
+                            msg_bloqueio = (
+                                f"🚫 **A unidade selecionada parece errada.** {n_outra} de {n_itens} etiquetas "
+                                f"Dox são da filial **{', '.join(filiais_outra)}**, mas a unidade "
+                                f"escolhida no topo é **{unidade} - {UNIDADES[unidade]}**. Por segurança, "
+                                "**nada foi gravado** na Base de Localização e a comparação com o estoque "
+                                "**não foi feita**. Corrija a unidade no topo e clique em "
+                                "**Converter Planilhas** de novo.")
+                        elif n_outra:
+                            aviso_filial = (
+                                f"{n_outra} leitura(s) com etiqueta de outra filial "
+                                f"({', '.join(filiais_outra)}). Elas ficaram em vermelho, com a observação, "
+                                "e **não** foram gravadas na base nem entram na comparação. Pode ser bobina "
+                                "transferida com etiqueta antiga: vale conferir.")
                         df_locais = resumo_por_local(df_mao)
 
                         # Descrição do produto (lista vinda do Protheus via robô)
@@ -1215,17 +1434,17 @@ with aba_mao:
                                               + (" ..." if len(sem_desc) > 10 else ""))
                         # Comparação com o estoque (opcional)
                         comparacao, aviso_estoque, hora_estoque = None, "", ""
-                        if comparar_estoque:
+                        if comparar_estoque and not bloqueio_filial:
                             try:
                                 estoque, hora_estoque = carregar_estoque()
-                                comparacao = comparar_com_estoque(df_mao, estoque)
+                                comparacao = comparar_com_estoque(df_mao, estoque, unidade)
                             except Exception:
                                 aviso_estoque = ("Não consegui ler o estoque do Protheus agora. "
                                                  "A conversão foi feita sem a comparação.")
 
                         # Base de Localização (opcional)
                         msg_base, aviso_base = "", ""
-                        if atualizar_base:
+                        if atualizar_base and not bloqueio_filial:
                             try:
                                 origem = ", ".join(a.name for a in arquivos_mao)[:100]
                                 n = gravar_base_localizacao(linhas_para_base(df_mao, origem))
@@ -1250,6 +1469,11 @@ with aba_mao:
                             "hora_estoque": hora_estoque,
                             "msg_base": msg_base,
                             "aviso_base": aviso_base,
+                            "msg_bloqueio": msg_bloqueio,
+                            "aviso_filial": aviso_filial,
+                            "n_forn": n_forn,
+                            "n_forn_nao": n_forn_nao,
+                            "aviso_forn": aviso_forn,
                         }
                     else:
                         st.session_state.pop("resultado_mao", None)
@@ -1261,6 +1485,16 @@ with aba_mao:
     if res:
         df_mao = res["df"]
         st.success(f"✅ Conversão concluída! {res['qtd_arquivos']} arquivo(s) processado(s).")
+        if res.get("msg_bloqueio"):
+            st.error(res["msg_bloqueio"])
+        if res.get("aviso_filial"):
+            st.warning(f"⚠️ {res['aviso_filial']}")
+        if res.get("aviso_forn"):
+            st.warning(f"⚠️ {res['aviso_forn']}")
+        if res.get("n_forn_nao"):
+            st.warning(f"⚠️ {res['n_forn_nao']} etiqueta(s) de fornecedor com lote **não encontrado** no estoque "
+                       f"do Protheus da unidade {unidade}. Elas entram na base normalmente (a localização física "
+                       "vale), mas confira: pode ser etiqueta lida errada ou lote cadastrado diferente no Protheus.")
         if res.get("aviso_desc"):
             st.warning(f"⚠️ {res['aviso_desc']}")
         if res.get("msg_base"):
@@ -1269,7 +1503,7 @@ with aba_mao:
             st.warning(f"⚠️ {res['aviso_base']}")
 
         st.subheader("📊 Resumo da conversão")
-        m1, m2, m3, m4, m5 = st.columns(5)
+        m1, m2, m3, m4, m5, m6 = st.columns(6)
         m1.metric("Itens lidos", len(df_mao),
                   help="Total de leituras de etiquetas (sem contar os QR de localização).")
         m2.metric("Localizações", int((res["locais"]["Localização"] != "SEM LOCALIZAÇÃO").sum()),
@@ -1279,7 +1513,11 @@ with aba_mao:
         m4.metric("Sem localização", int((df_mao["_status"] == "semloc").sum()),
                   help="Itens lidos antes de qualquer QR de localização na planilha. Ficam em laranja.")
         m5.metric("Leituras com erro", int((df_mao["_status"] == "erro").sum()),
-                  help="Leituras fora do padrão FILIAL-PRODUTO -ARMAZÉM-LOTE-PESO. Ficam em vermelho.")
+                  help="Leituras que não deu para aproveitar (etiqueta Dox incompleta, só o peso, QR de "
+                       "local sem nome) ou etiqueta Dox de outra filial. Ficam em vermelho.")
+        m6.metric("Etiq. de fornecedor", res.get("n_forn", 0),
+                  help="Bobinas lidas com a etiqueta do fornecedor (ainda sem etiqueta Dox). A filial vem da "
+                       "unidade do topo; código e armazém vêm do estoque do Protheus. Veja a coluna Observação.")
 
         st.markdown("#### 📍 Itens por localização")
         st.info("💡 Confira se as quantidades fazem sentido. Um local com muito mais itens que o normal, "
@@ -1299,7 +1537,8 @@ with aba_mao:
                    "tabela. Os locais aparecem na ordem em que foram lidos.")
 
         st.markdown("#### 👀 Prévia do arquivo")
-        st.caption("🟨 Lote lido mais de uma vez · 🟧 Sem localização · 🟥 Leitura fora do padrão")
+        st.caption("🟨 Lote lido mais de uma vez · 🟧 Sem localização · "
+                   "🟥 Leitura com erro (fora do padrão ou de outra filial)")
         colunas_vis = ["Filial", "Código", "Descrição", "Armazém", "Lote", "Peso", "Localização", "Observação"]
 
         def _colorir(row):
@@ -1325,7 +1564,7 @@ with aba_mao:
                     "podem gerar divergências que não são erro.")
             c1, c2, c3, c4, c5, c6 = st.columns(6)
             c1.metric("Lotes no Protheus", comp["n_protheus"],
-                      help="Lotes com saldo no Protheus na filial das etiquetas.")
+                      help="Lotes com saldo no Protheus na unidade escolhida no topo.")
             c2.metric("Lotes lidos", comp["n_lidos"], help="Lotes diferentes lidos no inventário.")
             c3.metric("Encontrados", comp["n_encontrados"],
                       help="Lotes que estão no Protheus e foram lidos.")
@@ -1420,6 +1659,8 @@ with aba_etiquetas:
 # ABA 4: ORDEM DE CARREGAMENTO
 # =====================================================================================
 with aba_ordem:
+    if not unidade:
+        st.warning(AVISO_SEM_UNIDADE)
     if 'uploader_key_ordem' not in st.session_state:
         st.session_state.uploader_key_ordem = 0
 
@@ -1436,7 +1677,9 @@ with aba_ordem:
             "📄 O PDF final traz, para cada carga: a **ordem original com a localização preenchida** "
             "na coluna *Localizac* e logo depois o **Roteiro de Separação**, com os itens agrupados por local.\n\n"
             "✏️ Lotes que não estão no inventário ficam com a localização **em branco**, para o "
-            "conferente preencher à mão. No roteiro eles aparecem no final, em laranja."
+            "conferente preencher à mão. No roteiro eles aparecem no final, em laranja.\n\n"
+            "🏭 Só são usadas as localizações da **unidade escolhida no topo**. Se anexar uma ordem de "
+            "outra unidade (o sistema confere pelo cabeçalho do PDF), ela **não é preenchida** e aparece um aviso."
         )
 
     origem_loc = st.radio(
@@ -1489,7 +1732,7 @@ with aba_ordem:
                       use_container_width=True, key="limpar_ordem")
 
     st.markdown("###")
-    if st.button("Preencher Ordens", type="primary", key="preencher_ordem"):
+    if st.button("Preencher Ordens", type="primary", key="preencher_ordem", disabled=not unidade):
         if not ordens_pdf:
             st.warning("⚠️ Anexe pelo menos uma Ordem de Carregamento (.pdf).")
         elif not usar_online and not bases_inv:
@@ -1499,11 +1742,11 @@ with aba_ordem:
                 try:
                     from pypdf import PdfWriter
                     if usar_online:
-                        base, lidos = montar_base(carregar_base_localizacao())
-                        origem_txt = ("Base de Localização (consultada em "
+                        base, lidos = montar_base(carregar_base_localizacao(), filial=unidade)
+                        origem_txt = (f"unidade {UNIDADES[unidade]} - Base de Localização (consultada em "
                                       f"{agora_br().strftime('%d/%m/%Y %H:%M')})")
                     else:
-                        base, datas = ler_base_inventario(bases_inv)
+                        base, datas = ler_base_inventario(bases_inv, filial=unidade)
                         lidos = None
                         # Data que vai no roteiro
                         datas = sorted(set(d for d in datas if d))
@@ -1515,10 +1758,10 @@ with aba_ordem:
                             data_base = " / ".join(datas)
                         else:
                             data_base = "data não informada"
-                        origem_txt = f"inventário de {data_base}"
+                        origem_txt = f"unidade {UNIDADES[unidade]} - inventário de {data_base}"
 
                     pdf_final = PdfWriter()
-                    resumo = []
+                    resumo, ordens_outra = [], []
                     for arq in ordens_pdf:
                         pdf_bytes = arq.getvalue()
                         cab, itens = ler_ordem_carregamento(io.BytesIO(pdf_bytes))
@@ -1526,6 +1769,10 @@ with aba_ordem:
                             st.warning(f"⚠️ Não encontrei itens no arquivo **{arq.name}**. "
                                        "Confira se é um Pick-list de Carregamento do Protheus.")
                             continue
+                        unid_pdf = unidade_da_ordem(cab.get("filial_txt"))
+                        if unid_pdf and unid_pdf != unidade:
+                            ordens_outra.append(f"**{arq.name}** ({cab.get('filial_txt')})")
+                            continue                  # ordem de outra unidade: não preenche
                         for pagina in carimbar_ordem(io.BytesIO(pdf_bytes), itens, base).pages:
                             pdf_final.add_page(pagina)
                         for pagina in gerar_roteiro(cab, itens, base, origem_txt, lidos).pages:
@@ -1548,9 +1795,13 @@ with aba_ordem:
                             "resumo": pd.DataFrame(resumo),
                             "origem_txt": origem_txt,
                             "lotes_base": len(base),
+                            "ordens_outra": ordens_outra,
                         }
                     else:
                         st.session_state.pop("resultado_ordem", None)
+                        if ordens_outra:
+                            st.error(MSG_ORDEM_OUTRA.format(unidade=f"{unidade} - {UNIDADES[unidade]}",
+                                                            lista="; ".join(ordens_outra)))
                 except Exception as e:
                     st.error(f"Ocorreu um erro: {e}")
 
@@ -1560,6 +1811,9 @@ with aba_ordem:
         df_res = res_o["resumo"]
         st.success(f"✅ {len(df_res)} ordem(ns) preenchida(s). Base com {res_o['lotes_base']} lotes "
                    f"({res_o.get('origem_txt', '')}).")
+        if res_o.get("ordens_outra"):
+            st.error(MSG_ORDEM_OUTRA.format(unidade=f"{unidade} - {UNIDADES[unidade]}",
+                                            lista="; ".join(res_o["ordens_outra"])))
 
         st.subheader("📊 Resumo")
         r1, r2, r3, r4 = st.columns(4)
@@ -1584,15 +1838,17 @@ with aba_ordem:
 # ABA 5: LOCALIZAR LOTE
 # =====================================================================================
 with aba_localizar:
+    if not unidade:
+        st.warning(AVISO_SEM_UNIDADE)
     st.info("Digite o **lote** (ex: `07700401003` ou `MIX 03`) para ver onde ele está. Se o lote exato "
             "não existir, o sistema mostra todos os lotes que **começam** com o que foi digitado "
-            "(ex: `07700401` lista toda a família).")
+            "(ex: `07700401` lista toda a família). A busca é feita só na **unidade escolhida no topo**.")
     termo_busca = st.text_input(
-        "Lote", value="", key="termo_lote", placeholder="07700401003",
+        "Lote", value="", key="termo_lote", placeholder="07700401003", disabled=not unidade,
         help="Lote encontrado: mostra a localização, quando foi lido e o saldo no Protheus. "
              "Lote não encontrado: lista os lotes que começam com o que foi digitado. Aperte Enter para buscar.")
 
-    termo_limpo = termo_busca.strip()
+    termo_limpo = termo_busca.strip() if unidade else ""
     if termo_limpo:
         if len(termo_limpo) < 3:
             st.warning("⚠️ Digite pelo menos **3 caracteres** do lote.")
@@ -1612,7 +1868,11 @@ with aba_localizar:
                     produtos_loc = carregar_produtos()
                 except Exception:
                     produtos_loc = {}
-                achados, exato = buscar_lote(termo_limpo, valores_base, estoque_loc)
+                achados, exato = buscar_lote(termo_limpo, valores_base, estoque_loc, filial=unidade)
+                outras_unidades = []
+                if not achados:   # não achou aqui: confere se existe em outra unidade
+                    outros, _ = buscar_lote(termo_limpo, valores_base, estoque_loc)
+                    outras_unidades = sorted(set(str(r["filial"]).zfill(2) for r in outros if r["filial"]))
 
             def _descricao(r):
                 return produtos_loc.get(r["codigo"], "") or r["produto"]
@@ -1623,8 +1883,13 @@ with aba_localizar:
                 return f"{formatar_ton(r['saldo'])} t (armazém {r['armazens_saldo']})"
 
             if not achados:
-                st.error(f"❌ Nenhum lote encontrado para **{termo_limpo}**, nem na Base de Localização "
-                         "nem no estoque do Protheus. Confira se digitou certo.")
+                st.error(f"❌ Nenhum lote encontrado para **{termo_limpo}** na unidade "
+                         f"**{unidade} - {UNIDADES[unidade]}**, nem na Base de Localização nem no estoque "
+                         "do Protheus. Confira se digitou certo.")
+                if outras_unidades:
+                    nomes = ", ".join(f"**{c} - {UNIDADES.get(c, 'outra filial')}**" for c in outras_unidades)
+                    st.info(f"ℹ️ Mas existe lote com esse número em: {nomes}. Para ver os detalhes, "
+                            "troque a unidade no topo.")
 
             elif exato and len(achados) == 1:
                 r = achados[0]
