@@ -1078,10 +1078,10 @@ def carimbar_ordem(arquivo, itens, base):
             c.setFont("Helvetica-Bold", tam)
             c.drawString(it["x0"] - 1, y + 0.5, texto)
         c.save()
-        if escreveu:
+        pagina_saida = saida.add_page(pagina)   # primeiro coloca a página no PDF novo...
+        if escreveu:                            # ...depois escreve a localização por cima
             buf.seek(0)
-            pagina.merge_page(PdfReader(buf).pages[0])
-        saida.add_page(pagina)
+            pagina_saida.merge_page(PdfReader(buf).pages[0])
     return saida
 
 
