@@ -7,7 +7,7 @@ google-generativeai
 langchain
 langchain-google-genai
 langchain-community
-pypdf
+pypdf==7.0.0
 faiss-cpu
 python-docx
 pdfplumber
